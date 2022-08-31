@@ -1,0 +1,34 @@
+# Never change wbadm's crontab with `crontab -e`. Instead, edit
+# /srv/wanna-build/etc/cron/crontab, and run `make` in that directory (or
+# install that file by hand). Also, please `git commit` any
+# non-temporary changes you make.
+
+#
+# Stats update.
+#
+MAILTO=cron-errors@buildd.debian.org
+PATH=/bin:/usr/bin:/usr/local/bin:/srv/wanna-build/bin:/srv/buildd.debian.org/bin
+
+*/5 * * * *	/srv/wanna-build/bin/process-triggers
+
+43 * * * *       /srv/buildd.debian.org/bin/wb-export
+
+3  0 * * *       make -sC /srv/wanna-build/etc/cron check
+
+4  0 * * *       /srv/buildd.debian.org/mbox/fix-up-permissions
+
+0 0 * * *	/usr/sbin/logrotate /srv/wanna-build/etc/logrotate.conf -s /srv/wanna-build/etc/logrotate.status
+
+*/15 * * * *	/srv/buildd.debian.org/wbpy/run-mqueue
+
+#*/5 * * * *	/home/aba/bin/mehdi-pull-push
+
+#0 5 * * *	(cd ~wbadm/wanna-build/schema && ./update-schema.sh)
+
+0 0 * * *	/srv/buildd.debian.org/bin/get-official-buildds
+
+2 0 * * *	/srv/buildd.debian.org/bin/gen_srcbin_assoc.py > /srv/buildd.debian.org/etc/binsrc_assoc.php
+
+5 3 * * *	/srv/wanna-build/bin/do_stats-ports > /dev/null 2>&1
+
+* * * * *	/srv/buildd.debian.org/bin/git-sync-salsa

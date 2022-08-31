@@ -1,0 +1,12 @@
+[Unit]
+Description=Buildd for amd64 as Docker instance
+After=network-online.target
+Requires=network-online.target
+
+[Service]
+ExecStart=docker run --rm -t --privileged --hostname buildd-amd64 --mount type=bind,source=/srv/buildd/amd64,target=/srv/buildd --domainname ci.tmaxos.net --name buildd-amd64 harbor.tmaxos.net/infra/buildd-amd64:1.0.0
+ExecStop=docker stop buildd-amd64
+
+[Install]
+WantedBy=multi-user.target
+Alias=buildd-amd64.service

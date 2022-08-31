@@ -1,0 +1,21 @@
+#!/bin/sh
+
+sbuild-adduser buildd
+rm -rf /srv/buildd/*
+rm -rf /etc/sbuild/chroot/* /etc/schroot/chroot.d/*
+
+sbuild-createchroot --arch=arm64 \
+	--components=main,contrib,non-free tmax-unstable \
+	/srv/buildd/tmax-unstable-arm64-sbuild \
+	http://192.168.1.211:8080/tmax
+
+su --login buildd <<EOF
+gpg --import buildd.gpg
+rm buildd.gpg
+EOF
+
+# replace the signing key to the appropriate one
+# sed ...
+
+/etc/init.d/buildd start
+cron -f

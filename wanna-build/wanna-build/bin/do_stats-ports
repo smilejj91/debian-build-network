@@ -1,0 +1,16 @@
+#!/bin/bash
+
+#
+# Only update stats if it's been at least 20h since the last time.
+#
+interval=72000
+last=`stat --format="%Y" /srv/wanna-build/etc/graph-ports-data`
+now=`date +%s`
+if (( $last + $interval < $now )); then
+        echo "stats start: `date`"
+	/srv/wanna-build/bin/wb-ports-graph >> /srv/wanna-build/etc/graph-ports-data
+	/srv/wanna-build/bin/wb-ports-graph -p >> /srv/wanna-build/etc/graph2-ports-data
+	R --slave --vanilla < /srv/wanna-build/etc/graph-ports.R
+        echo "stats ended: `date`"
+fi
+

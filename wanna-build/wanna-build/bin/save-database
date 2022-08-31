@@ -1,0 +1,12 @@
+#!/bin/bash
+
+PREFIX=$1
+
+pg_dump service=wanna-build-privileged | gzip > /srv/wanna-build/dumps/dump_${PREFIX}_$(date +%Y.%m.%d-%H:%M:%S).gz
+
+# Expire dumps only on post-trigger saves.
+if [ "$PREFIX" = "post" ]
+then
+	(cd /srv/wanna-build/dumps && /srv/wanna-build/bin/expire_dumps -d . -f "dump_*")
+fi
+

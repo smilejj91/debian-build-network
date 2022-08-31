@@ -1,0 +1,305 @@
+#
+# buildds for the main archive
+#
+
+- antheil:
+    - architecture: armel armhf
+- arm-arm-01:
+    - architecture: arm64 armhf armel
+- arm-arm-03:
+    - architecture: arm64 armhf armel
+- arm-arm-04:
+    - architecture: arm64 armhf armel
+- arm-conova-01:
+    - architecture: arm64 armhf armel
+- arm-conova-02:
+    - architecture: arm64 armhf armel
+- arm-conova-03:
+    - architecture: armel armhf
+- arm-ubc-01:
+    - architecture: arm64 armhf armel
+- arm-ubc-02:
+    - architecture: arm64 armhf armel
+- arm-ubc-03:
+    - architecture: arm64 armhf armel
+- arm-ubc-04:
+    - architecture: armel armhf
+- arm-ubc-05:
+    - architecture: armel armhf
+- arm-ubc-06:
+    - architecture: armel armhf
+- mips-aql-01:
+    - architecture: mips
+- mips-aql-02:
+    - architecture: mips
+- mips-aql-04:
+    - architecture: mips
+- mips-aql-05:
+    - architecture: mips
+- mips-aql-06:
+    - architecture: mips
+- mips-manda-01:
+    - architecture: mips
+- mips-sil-01:
+    - architecture: mips
+- eberlin:
+    - architecture: mipsel mips64el
+- mipsel-manda-01:
+    - architecture: mipsel mips64el
+- mipsel-manda-02:
+    - architecture: mipsel mips64el
+- mipsel-manda-03:
+    - architecture: mipsel mips64el
+- mipsel-manda-04:
+    - architecture: mipsel mips64el
+- mipsel-manda-05:
+    - architecture: mipsel mips64el
+- mipsel-aql-01:
+    - architecture : mipsel mips64el
+- mipsel-aql-02:
+    - architecture : mipsel mips64el
+- mipsel-aql-03:
+    - architecture : mipsel mips64el
+- mipsel-osuosl-01:
+    - architecture: mipsel mips64el
+- mipsel-osuosl-02:
+    - architecture: mipsel mips64el
+- mipsel-osuosl-03:
+    - architecture: mipsel mips64el
+- mipsel-osuosl-04:
+    - architecture: mipsel mips64el
+- mipsel-osuosl-05:
+    - architecture: mipsel mips64el
+- mipsel-sil-01:
+    - architecture : mipsel mips64el
+- hasse:
+    - architecture: armhf armel
+- hartmann:
+    - architecture: armhf armel
+- henze:
+    - architecture: armhf armel
+- hoiby:
+    - architecture: armhf armel
+- zandonai:
+    - architecture: s390x
+- zani:
+    - architecture: s390x
+- ppc64el-osuosl-01:
+    - architecture: ppc64el
+- ppc64el-unicamp-01:
+    - architecture: ppc64el
+- x86-conova-01:
+    - architecture: all amd64 i386
+- x86-csail-01:
+    - architecture: amd64 i386
+- x86-grnet-01:
+    - architecture: amd64 i386
+- x86-ubc-01:
+    - architecture: amd64 i386
+- x86-ubc-02:
+    - architecture: amd64 i386
+- x86-csail-02:
+    - architecture: all
+- x86-grnet-02:
+    - architecture: all
+
+
+#
+# buildds for the debian-ports archive
+#
+
+- alpha-sc-01:
+    - architecture: alpha
+- alpha-sc-02:
+    - architecture: alpha
+- alpha-sc-03:
+    - architecture: alpha
+- alpha-sc-04:
+    - architecture: alpha
+- imago:
+    - architecture: alpha
+- electro:
+    - architecture: alpha
+- tsunami:
+    - architecture: alpha
+
+- c8000:
+    - architecture: hppa
+- mx3210:
+    - architecture: hppa
+- pacific:
+    - architecture: hppa
+- panama:
+    - architecture: hppa
+- paq:
+    - architecture: hppa
+- parisc:
+    - architecture: hppa
+- pasta:
+    - architecture: hppa
+- phantom:
+    - architecture: hppa
+
+- mozart:
+    - architecture: hurd-i386
+- bach:
+    - architecture: hurd-i386
+- ironforge:
+    - architecture: hurd-i386
+- rossini:
+    - architecture: hurd-i386
+- mahler:
+    - architecture: hurd-i386
+
+- kamp:
+    - architecture: kfreebsd-amd64 kfreebsd-i386
+
+- iridium:
+    - architecture: ia64
+- lenz:
+    - architecture: ia64
+- lifshitz:
+    - architecture: ia64
+- titanium:
+    - architecture: ia64
+
+- ara5:
+    - architecture: m68k
+- mama:
+    - architecture: m68k
+- m68k-do-01:
+    - architecture: m68k
+- m68k-do-02:
+    - architecture: m68k
+- m68k-gandi-01:
+    - architecture: m68k
+- m68k-gandi-02:
+    - architecture: m68k
+- vs90:
+    - architecture: m68k
+- vs91:
+    - architecture: m68k
+- vs92:
+    - architecture: m68k
+- vs93:
+    - architecture: m68k
+
+- amaterasu:
+    - architecture: ppc64
+- izanagi:
+    - architecture: ppc64
+- izanami:
+    - architecture: ppc64
+- susanoo:
+    - architecture: ppc64
+- tsukuyomi:
+    - architecture: ppc64
+
+- blaauw:
+    - architecture: ppc64 powerpc
+- kapitsa:
+    - architecture: ppc64 powerpc
+
+- rv-aurel32-01:
+    - architecture: riscv64
+- rv-aurel32-02:
+    - architecture: riscv64
+- rv-hfu-01:
+    - architecture: riscv64
+- rv-mit-01:
+    - architecture: riscv64
+- rv-mit-02:
+    - architecture: riscv64
+- rv-mit-03:
+    - architecture: riscv64
+- rv-mit-04:
+    - architecture: riscv64
+- rv-mit-05:
+    - architecture: riscv64
+- rv-mit-06:
+    - architecture: riscv64
+- rv-mit-07:
+    - architecture: riscv64
+- rv-mit-08:
+    - architecture: riscv64
+- rv-mit-09:
+    - architecture: riscv64
+- rv-mit-10:
+    - architecture: riscv64
+- rv-mit-11:
+    - architecture: riscv64
+- rv-mit-12:
+    - architecture: riscv64
+- rv-mit-13:
+    - architecture: riscv64
+- rv-mit-14:
+    - architecture: riscv64
+- rv-mit-15:
+    - architecture: riscv64
+- rv-mit-16:
+    - architecture: riscv64
+- rv-mit-17:
+    - architecture: riscv64
+- rv-mit-18:
+    - architecture: riscv64
+- rv-mullvad-01:
+    - architecture: riscv64
+- rv-mullvad-02:
+    - architecture: riscv64
+- rv-mullvad-03:
+    - architecture: riscv64
+- rv-osuosl-01:
+    - architecture: riscv64
+- rv-osuosl-02:
+    - architecture: riscv64
+- rv-rr44-01:
+    - architecture: riscv64
+
+- hiei:
+    - architecture: sh4
+- hyuga:
+    - architecture: sh4
+- ise:
+    - architecture: sh4
+- mutsu:
+    - architecture: sh4
+- sh4-do-01:
+    - architecture: sh4
+- sh4-do-02:
+    - architecture: sh4
+- sh4-gandi-01:
+    - architecture: sh4
+- sh4-gandi-02:
+    - architecture: sh4
+- tirpitz:
+    - architecture: sh4
+- vs94:
+    - architecture: sh4
+- vs95:
+    - architecture: sh4
+- vs96:
+    - architecture: sh4
+- vs97:
+    - architecture: sh4
+
+- andi:
+    - architecture: sparc64
+- landau:
+    - architecture: sparc64
+- nvg5120:
+    - architecture: sparc64
+- sompek:
+    - architecture: sparc64
+- osaka:
+    - architecture: sparc64
+- raverin:
+    - architecture: sparc64
+
+- frobozz:
+    - architecture: x32
+- vs76:
+    - architecture: x32
+- x32-do-01:
+    - architecture: x32
+- x32-do-02:
+    - architecture: x32

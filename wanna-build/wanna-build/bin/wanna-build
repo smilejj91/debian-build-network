@@ -1,0 +1,2446 @@
+#!/usr/bin/perl
+# 
+# wanna-build: coordination script for Debian buildds
+# Copyright (C) 1998 Roman Hodek <Roman.Hodek@informatik.uni-erlangen.de>
+# Copyright (C) 2005-2008 Ryan Murray <rmurray@debian.org>
+# Copyright (C) 2010,2011 Andreas Barth <aba@not.so.argh.org>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation; either version 2 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+#
+use strict;
+use warnings;
+use 5.010;
+
+package conf;
+use File::Basename qw(dirname);
+use Cwd 'abs_path';
+
+use vars qw< $wbdir $mailprog $buildd_domain $pg_service $pg_priv_service >;
+# defaults
+BEGIN {
+	my $scriptpath = abs_path(__FILE__);
+	$wbdir = abs_path(dirname($scriptpath)."/../");
+}
+$mailprog ||= "/usr/sbin/sendmail";
+require "$conf::wbdir/etc/wanna-build.conf";
+die "mailprog binary $conf::mailprog does not exist or isn't executable\n"
+        if !-x $conf::mailprog;
+package main;
+
+die "wanna-build disabled" if -f "$conf::wbdir/NO-WANNA-BUILD";
+
+use POSIX;
+use FileHandle;
+use File::Copy;
+use DBI;
+use Getopt::Long qw (GetOptionsFromString :config gnu_getopt );
+use lib "$conf::wbdir/lib";
+#use lib 'lib';
+use WannaBuild;
+use YAML::Tiny;
+use YAML::XS;
+use Data::Dumper;
+use Hash::Merge qw ( merge );
+use String::Format;
+use Date::Parse;
+use List::Util qw[max];
+use URI::Escape;
+use IPC::Run qw(run);
+use Dpkg::Version (); # import nothing
+if ( defined $Dpkg::Version::VERSION ) {
+    *vercmp = \&Dpkg::Version::version_compare;
+} else {
+    *vercmp = \&Dpkg::Version::vercmp;
+}
+
+use Dpkg::Deps; # TODO: same
+
+$Dpkg::DATADIR=$conf::dpkg_datadir if defined $conf::dpkg_datadir;
+$Data::Dumper::Sortkeys = 1;
+
+our ($verbose, $mail_logs, $list_order, $list_state,
+    $curr_date, $op_mode, $user, $real_user, $distribution,
+    $fail_reason, $opt_override, $import_from, $export_to,
+    %prioval, %sectval,
+    $info_all_dists, $arch, $archive,
+    $short_date, $list_min_age, $list_max_age, @curr_time,
+    $build_priority, %new_vers, $binNMUver, %merge_srcvers, %merge_binsrc,
+    $printformat, $ownprintformat, $privmode, $extra_depends, $extra_conflicts,
+    %distributions, %distribution_aliases, %distribution_architectures, $actions,
+    $sshwrapper,
+    );
+our $Pas = '/srv/buildd.debian.org/etc/packages-arch-specific/Packages-arch-specific';
+our $simulate = 0;
+our $simulate_dose = 0;
+our $api = undef; # allow buildds to specify an different api
+our $defaultapi = undef;
+our $recorduser = undef;
+
+# global vars
+$ENV{'PATH'} = "/bin:/usr/bin:/usr/local/bin:$conf::wbdir/bin/";
+$ENV{'LC_ALL'} = 'C';
+$verbose = 0;
+$mail_logs = "";
+@curr_time = gmtime;
+$curr_date = strftime("%Y %b %d %H:%M:%S",@curr_time);
+$short_date = strftime("%m/%d/%y",@curr_time);
+$| = 1;
+
+# set mode of operation based on command line switch. Should be used
+# by GetOptions below.
+sub _set_mode_set { $op_mode = "set-$_[0]" }
+sub _set_mode { $op_mode = "$_[0]" }
+
+sub _option_deprecated { warn "Option $_[0] is deprecated" }
+
+my @wannabuildoptions = (
+    # this is not supported by all operations (yet)!
+    'simulate'      => \$simulate,
+    'simulate-edos' => \$simulate_dose,
+    'simulate-dose' => \$simulate_dose,
+    'simulate-all'  => sub { $simulate = 1; $simulate_dose = 1; },
+    'api=i'         => sub {
+        $api = $_[1];
+        die "$api too large" unless $api <= 2;
+    },
+    'verbose|v'       => sub { $verbose++; },
+    'override|o'      => \$opt_override,
+    'correct-compare' => \$WannaBuild::opt_correct_version_cmp,
+
+    # TODO: remove after buildds no longer pass to wanna-build
+    'no-propagation|N'      => \&_option_deprecated,
+    'no-down-propagation|D' => \&_option_deprecated,
+
+    # normal actions
+    'building|take'         => \&_set_mode_set,
+    'failed|f'              => \&_set_mode_set,
+    'uploaded|u'            => \&_set_mode_set,
+    'not-for-us|no-build|n' => \&_set_mode_set,
+    'built'                 => \&_set_mode_set,
+    'attempted'             => \&_set_mode_set,
+    'needs-build|give-back' => \&_set_mode_set,
+    'dep-wait'              => \&_set_mode_set,
+    'update'                => \&_set_mode_set,
+    'forget'                => \&_set_mode,
+    'forget-user'           => \&_set_mode,
+    'merge-v3'              => \&_set_mode,
+    'info|i'                => \&_set_mode,
+    'binary-nmu|binNMU=i'   => sub {
+        _set_mode_set(@_);
+        $binNMUver = $_[1];
+    },
+    'permanent-build-priority|perm-build-priority=i' => sub {
+        _set_mode_set(@_);
+        $build_priority = $_[1];
+    },
+    'build-priority=i' => sub {
+        _set_mode_set(@_);
+        $build_priority = $_[1];
+    },
+    'list|l=s' => sub {
+        _set_mode(@_);
+        $list_state = $_[1];
+        die "Unknown state to list: $list_state\n"
+          if !isin($list_state,
+              qw( needs-build building uploaded built
+                  build-attempted failed installed
+                  dep-wait not-for-us auto-not-for-us
+                  all failed-removed install-wait
+                  reupload-wait bd-uninstallable ));
+    },
+    'dist|d=s' => sub {
+        my $c;
+        ($distribution, $c) = split("/", $_[1]);
+        $arch = $c if $c;
+        if ($distribution eq 'a' or $distribution eq 'all') {
+            $info_all_dists = 1;
+            $distribution   = '';
+        }
+        elsif ($distribution eq 'o') {
+            $distribution = 'oldstable';
+        }
+        elsif ($distribution eq 's') {
+            $distribution = 'stable';
+        }
+        elsif ($distribution eq 't') {
+            $distribution = 'testing';
+        }
+        elsif ($distribution eq 'u') {
+            $distribution = 'unstable';
+        }
+        elsif ($distribution eq 'any-priv') {
+            $privmode = 1;
+            $distribution = 'any';
+        }
+        elsif ($distribution eq 'any-unpriv') {
+            $privmode = 0;
+            $distribution = 'any';
+        }
+        $privmode = 1 if $distribution =~ /security/;
+    },
+    'order|O=s' => sub {
+        $list_order = $_[1];
+        die "Bad ordering character\n"
+          if $list_order !~ /^[PSpsncbCWT]+$/;
+    },
+    'message|m=s'  => \$fail_reason,
+    'arch|A=s'     => \$arch,
+    'archive|a=s'  => \$archive,
+    'user|U=s'     => \$user,
+    'min-age=f'         => \$list_min_age,
+    'max-age=f'         => \$list_max_age,
+    'format=s'          => \$printformat,
+    'own-format=s'      => \$ownprintformat,
+    'Pas=s'             => \$Pas,
+    'extra-depends=s'   => \$extra_depends,
+    'extra-conflicts=s' => \$extra_conflicts,
+
+    # special actions
+    'export=s' => sub { _set_mode(@_); $export_to   = $_[1]; },
+    'import=s' => sub { _set_mode(@_); $import_from = $_[1]; },
+    'distribution-architectures' => \&_set_mode,
+    'distribution-aliases'       => \&_set_mode,
+
+    'ssh-wrapper'       => \$sshwrapper,
+    'recorduser'        => \$recorduser,
+    );
+
+my @sshwrapperoptions = (
+    'ssh-wrapper'   => \$sshwrapper,
+);
+
+# this indicates what is not necessary/used for the given commands
+# nopriv: command doesn't need privileged database connection
+# nopkg:  command doesn't operate on packages
+# noarch: command doesn't know/use architectures
+my $commands = {
+    'list' => {'nopriv' => 1, 'nopkg' => 1},
+    'info' => {'nopriv' => 1, },
+    'distribution-architectures' => {'nopriv' => 1, 'nopkg' => 1, 'noarch' => 1,},
+    'distribution-aliases' => {'nopriv' => 1, 'nopkg' => 1, 'noarch' => 1,},
+    'export' => { 'nopkg' => 1},
+};
+
+my $printargv = join('#', @ARGV);
+my $hostdefaults = {};
+if ($ARGV[0] && $ARGV[0] eq '--ssh-wrapper') {
+    die ("no SSH_ORIGINAL_COMMAND") unless exists $ENV{'SSH_ORIGINAL_COMMAND'};
+    GetOptions(@sshwrapperoptions) or usage();
+    $#ARGV == 0 or die("need exactly one host name");
+    my $hosts = YAML::XS::LoadFile( "$conf::wbdir/etc/yaml/buildd.yaml" );
+    my ($hostyaml, $defaultyaml);
+    foreach my $host (@$hosts) {
+        $hostyaml = $host->{$ARGV[0]} if (keys %$host)[0] eq $ARGV[0];
+        $defaultyaml = $host->{'default'} if (keys %$host)[0] eq 'default';
+    }
+    if (!$hostyaml) {
+        die("ERROR: unknown host $ARGV[0]");
+    }
+    my $mergedyaml = merge($defaultyaml, $hostyaml);
+    $mergedyaml //= $hostyaml;
+    foreach my $k (@$mergedyaml) {
+        foreach my $l (keys %$k) {
+            $hostdefaults->{$l} = $k->{$l};
+        }
+    }
+    $hostdefaults->{'host'} = $ARGV[0];
+    my $arg = $ENV{'SSH_ORIGINAL_COMMAND'};
+    $arg =~ s,^([^ ]*wanna-build) ,, || die ("command needs to call wanna-build");
+
+    my ($ret, $args) = GetOptionsFromString($arg,@wannabuildoptions);
+    $ret or usage();
+    @ARGV = @$args;
+
+    $hostdefaults->{'db-user'} //= 'buildd-'.$hostdefaults->{'host'};
+    ($arch, ) = split(" ",$hostdefaults->{'architecture'}) unless defined $arch;
+    $user //= $hostdefaults->{'db-user'};
+    $recorduser=1 unless $simulate;
+    use Sys::Syslog qw(:standard :macros);
+    openlog("wanna-build::ssh-wrapper", "", "user");
+    if (defined $hostdefaults->{'architecture'} and not isin($arch, split(" ",$hostdefaults->{'architecture'}))) {
+        syslog("debug", "%s: ERROR: %s", ($hostdefaults->{'host'}, "architecture not allowed: $arch"));
+        die("architecture $arch not allowed for this buildd") ;
+    }
+
+    if (not $distribution or $distribution !~ /security/) {
+        syslog("debug", "%s: %s", ($hostdefaults->{'host'}, $ENV{'SSH_ORIGINAL_COMMAND'}));
+    }
+    $defaultapi = 0;
+} else {
+    GetOptions(@wannabuildoptions) or usage();
+    $defaultapi = 1;
+}
+$op_mode ||= "set-building";
+
+my $dbh;
+END {
+	if (defined $dbh)
+	{
+		$dbh->disconnect or warn $dbh->errstr;
+	}
+}
+
+my $schema_suffix = '';
+if ((
+    ($commands->{$op_mode} && $commands->{$op_mode}->{'nopriv'})
+    && !$recorduser && !$privmode) || $simulate) {
+	$dbh = DBI->connect("DBI:Pg:service=$conf::pg_service") ||
+		die "FATAL: Cannot open database: $DBI::errstr\n";
+	$schema_suffix = '_public';
+}
+else
+{
+	$dbh = DBI->connect("DBI:Pg:service=$conf::pg_priv_service") ||
+		die "FATAL: Cannot open database: $DBI::errstr\n";
+}
+
+# TODO: This shouldn't be needed, file a bug.
+$dbh->{pg_server_prepare} = 0;
+
+$dbh->begin_work or die $dbh->errstr;
+
+my $q = 'SELECT distribution, public, auto_dep_wait, build_dep_resolver, build_dep_alternatives, suppress_successful_logs, mail_logs FROM distributions';
+my $rows = $dbh->selectall_hashref($q, 'distribution');
+foreach my $name (keys %$rows) {
+	$distributions{$name} = {};
+	$distributions{$name}->{'noadw'} = 1 if !($rows->{$name}->{'auto_dep_wait'});
+	$distributions{$name}->{'hidden'} = 1 if !($rows->{$name}->{'public'});
+	$distributions{$name}->{'build_dep_resolver'} = $rows->{$name}->{'build_dep_resolver'} if $rows->{$name}->{'build_dep_resolver'};
+	$distributions{$name}->{'build_dep_alternatives'} = 1 if ($rows->{$name}->{'build_dep_alternatives'});
+	$distributions{$name}->{'suppress_successful_logs'} = $rows->{$name}->{'suppress_successful_logs'} if $rows->{$name}->{'suppress_successful_logs'};
+	$distributions{$name}->{'mail_logs'} = $rows->{$name}->{'mail_logs'} if $rows->{$name}->{'mail_logs'};
+}
+
+if (defined($archive)) {
+    $rows = $dbh->selectall_hashref('SELECT distribution, architecture, archive, vancouvered FROM distribution_architectures WHERE archive = ?', [qw<distribution architecture>], undef, ($archive,));
+} else {
+    $rows = $dbh->selectall_hashref('SELECT distribution, architecture, archive, vancouvered FROM distribution_architectures', [qw<distribution architecture>]);
+}
+foreach my $name (keys %$rows) {
+    foreach my $arch (keys %{$rows->{$name}}) {
+        $distribution_architectures{$name}{$arch} = {};
+        $distribution_architectures{$name}{$arch}->{'archive'} = $rows->{$name}->{$arch}->{'archive'} if $rows->{$name}->{$arch}->{'archive'};
+        $distribution_architectures{$name}{$arch}->{'vancouvered'} = 1 if $rows->{$name}->{$arch}->{'vancouvered'};
+    }
+}
+
+$q = 'SELECT alias, distribution FROM distribution_aliases';
+$rows = $dbh->selectall_hashref($q, 'alias');
+foreach my $name (keys %$rows) {
+	$distribution_aliases{$name} = $rows->{$name}->{'distribution'};
+}
+$distribution = $distribution_aliases{$distribution} if (isin($distribution, keys %distribution_aliases));
+
+if ($distribution) {
+    my @dists = split(/[, ]+/, $distribution);
+    foreach my $dist (@dists) {
+        die "Bad distribution '$distribution'\n"
+	    if !isin($dist, keys %distributions, "any");
+    }
+}
+if (!isin ( $op_mode, qw(list) ) && ( ($distribution//"") =~ /[ ,]/)) {
+    die "multiple distributions are only allowed for list";
+}
+
+# TODO: Check that it's an known arch (for that dist), and give
+# a proper error.
+
+if ($verbose) {
+	my $version = '$Id$';
+	$version =~ s/^.* ([a-f0-9]+) .*$/$1/g;
+	print "wanna-build $version for ".($distribution//"sid")." on $arch - $printargv\n";
+}
+
+if (!@ARGV && 
+    (!($commands->{$op_mode}) || !($commands->{$op_mode}->{'nopkg'}))
+                                  ) {
+	warn "No packages given.\n";
+	usage();
+}
+
+$real_user = (getpwuid($<))[0];
+die "Can't determine your user name\n"
+	if $op_mode ne "list" && !$user &&
+	   !($user = $real_user);
+
+if (!$fail_reason) {
+	if ($op_mode eq "set-failed" ) {
+		print "Enter reason for failing (end with '.' alone on ".
+		      "its line):\n";
+		my $line;
+		while(!eof(STDIN)) {
+			$line = <STDIN>;
+			last if $line eq ".\n";
+			$fail_reason .= $line;
+		}
+		chomp( $fail_reason );
+	} elsif ($op_mode eq "set-dep-wait") {
+		print "Enter dependencies (one line):\n";
+		my $line;
+		while( !$line && !eof(STDIN) ) {
+			chomp( $line = <STDIN> );
+		}
+		die "No dependencies given\n" if !$line;
+		$fail_reason = $line;
+	} elsif ($op_mode eq "set-binary-nmu" and $binNMUver > 0) {
+		print "Enter changelog entry (one line):\n";
+		my $line;
+		while( !$line && !eof(STDIN) ) {
+			chomp( $line = <STDIN> );
+		}
+		die "No changelog entry given\n" if !$line;
+		$fail_reason = $line;
+	}
+}
+
+my $yamlmap = ();
+my $yamldir = "$conf::wbdir/etc/yaml";
+my @files = ('wanna-build.yaml');
+if ((getpwuid($>))[7]) { push (@files, ((getpwuid($>))[7])."/.wanna-build.yaml"); }
+if ($user) { push ( @files, "$user.yaml"); }
+foreach my $file (@files) {
+        my $cfile = File::Spec->rel2abs( $file, $yamldir );
+	if ($verbose >= 2) { print "Trying to read $file ($cfile) ...\n"; }
+	next unless -f $cfile;
+	if ($verbose >= 2) { print "Read $file ($cfile) ...\n"; }
+	my $m = YAML::XS::LoadFile( $cfile );
+	$yamlmap = merge($m, $yamlmap);
+}
+if (not $yamlmap) {
+	die "FATAL: no configuration found\n";
+}
+$list_order = $yamlmap->{"list-order"}{$list_state} if !$list_order and $list_state;
+$list_order ||= $yamlmap->{"list-order"}{'default'};
+$api //= $yamlmap->{"api"};
+$api //= $defaultapi;
+
+if (isin($op_mode, qw<forget-user merge-v3 import>) && @conf::admin_users && !isin( $real_user, @conf::admin_users) && !$simulate ) {
+    die "This operation is restricted to admin users";
+}
+if (!($commands->{$op_mode}) || !($commands->{$op_mode}->{'noarch'})) {
+    die "need an architecture" unless $arch;
+    if (($distribution//"sid") ne 'any') {
+        die "architecture ($arch) does not exist (at least not for ".($distribution//"sid").")" if !$distribution_architectures{$distribution//"sid"}{$arch};
+    } else {
+        my $found = 0;
+        foreach (keys %distribution_architectures) {
+            $found = 1 if $distribution_architectures{$_}{$arch};
+        }
+        die "architecture ($arch) does not exist" if !$found;
+    }
+}
+
+my $orig_distribution = $distribution;
+$distribution ||='sid';
+undef $distribution if $distribution eq 'any';
+
+	SWITCH: foreach ($op_mode) {
+		/^set-(.+)/ && do {
+			add_packages( {'newstate' => $1, 'arch' => $arch, 'dist' => $distribution }, @ARGV );
+			last SWITCH;
+		};
+		/^list/ && do {
+			list_packages( {'state' => $list_state, 'arch' => $arch, 'dist' => $distribution } );
+			last SWITCH;
+		};
+		/^info/ && do {
+			info_packages( {'arch' => $arch, 'dist' => $distribution }, @ARGV );
+			last SWITCH;
+		};
+		/^forget-user/ && do {
+			forget_users({'arch' => $arch, 'dist' => $distribution }) unless $simulate;
+			last SWITCH;
+		};
+		/^forget/ && do {
+			forget_packages( {'arch' => $arch, 'dist' => $distribution }, @ARGV );
+			last SWITCH;
+		};
+		/^merge-v3/ && do {
+                        # call with installed-packages+ . installed-sources+ [ . available-for-build-packages* [ . consider-as-installed-source* ]  ]
+                        # in case available-for-build-packages is not specified, installed-packages are used
+                        lock_table() unless $simulate;
+                        my $replacemap = { '%ARCH%' => $arch, '%SUITE%' => $distribution };
+                        map { my $k = $_; grep { $k =~ s,$_,$replacemap->{$_}, } keys %{$replacemap}; $_ = $k; } @ARGV;
+                        my @ipkgs = &parse_argv( \@ARGV, '.'); # installed packages
+                        my @isrcs = &parse_argv( \@ARGV, '.'); # installed sources
+                        my @bpkgs = &parse_argv( \@ARGV, '.'); # packages available for building (dose-builddebcheck)
+                        my @psrcs = &parse_argv( \@ARGV, '.'); # consider as installed sources
+                        use WB::QD;
+                        my $srcs = WB::QD::readsourcebins($arch, $Pas, \@isrcs, \@ipkgs);
+                        if (@psrcs) {
+                            # Installed sources of the base suite: only add them as related, not
+                            # installed; skip the entries if we got something in installed
+                            # sources already.
+                            my $psrcs = WB::QD::readsourcebins($arch, $Pas, \@psrcs, []);
+                            foreach my $k (keys %$$psrcs) {
+                                next if $$srcs->{$k};
+                                my $pkg = $$psrcs->{$k};
+                                $pkg->{'status'} = 'related';
+                                $$srcs->{$k} = $pkg;
+                            }
+                        }
+                        parse_all_v3($$srcs, {'arch' => $arch, 'suite' => $distribution, 'time' => $curr_date});
+                        # The packages passed to dose-builddebcheck are normally the binaries available,
+                        # unless you've also a base suite the builder will take packages from.
+                        @bpkgs = @ipkgs unless @bpkgs;
+                        call_dose_builddebcheck( {'arch' => $arch, 'pkgs' => \@bpkgs, 'srcs' => $$srcs, 'depwait' => 1 });
+                        last SWITCH;
+		};
+		/^import/ && do {
+			last SWITCH if $simulate;
+			$dbh->do("DELETE from ".table_name('packages', $arch)." WHERE distribution = ?", undef, $distribution)
+				or die $dbh->errstr;
+			forget_users({'arch' => $arch, 'dist' => $distribution });
+			read_db( $import_from );
+			last SWITCH;
+		};
+		/^export/ && do {
+			export_db( $export_to );
+			last SWITCH;
+		};
+		/^distribution-architectures/ && do {
+			show_distribution_architectures({'suite' => $orig_distribution});
+			last SWITCH;
+		};
+		/^distribution-aliases/ && do {
+			show_distribution_aliases();
+			last SWITCH;
+		};
+
+		die "Unexpected operation mode $op_mode\n";
+	}
+	if ($recorduser and not $simulate) {
+		my @distributions;
+
+		if (defined($distribution)) {
+			push @distributions, ($distribution);
+		} else {
+			foreach my $dist (keys %distribution_architectures) {
+				if (exists($distribution_architectures{$dist}{$arch})) {
+					push @distributions, ($dist);
+				}
+			}
+		}
+
+		foreach my $dist (@distributions) {
+			my $userinfo = get_user_info(name => $user, dist => $dist);
+			if (!defined $userinfo)
+			{
+				add_user_info(user => $user, dist => $dist);
+			}
+			else
+			{
+				update_user_info(user => $user, dist => $dist);
+			}
+		}
+	}
+
+
+$dbh->commit unless $simulate;
+$dbh->disconnect;
+
+if ($mail_logs && $conf::log_mail) {
+	send_mail( $conf::log_mail,
+			   "wanna-build $distribution state changes $curr_date",
+			   "State changes at $curr_date for distribution ".
+			   "$distribution:\n\n$mail_logs\n" );
+}
+
+exit 0;
+
+
+BEGIN {
+    $actions = {
+        'building'  => { 'noversion' => 1, 'nopkgdef' => 1, },
+        'built'     => { 'builder' => 1, to => 'Built', action => 'built', 'from' => [qw<Building Build-Attempted>]},
+        'attempted' => { 'builder' => 1, to => 'Build-Attempted', action => 'attempted', 'from' => [qw<Building Build-Attempted>]},
+        'uploaded'  => { 'builder' => 1, to => 'Uploaded', action => 'uploaded', 'from' => [qw<Building Built Build-Attempted>], binversion => 1, },
+        'failed'    => { 'builder' => 1, to => 'Failed', action => 'failed', from => [qw<Building Built Build-Attempted Dep-Wait Failed>], warnfrom => [qw<Needs-Build Uploaded Dep-Wait BD-Uninstallable>], },
+        'dep-wait'  => { 'builder' => 1, warnfrom => [qw<Needs-Build Failed BD-Uninstallable>], },
+        'update'    => { 'noversion' => 1, },
+        'needs-build' => { builder => 1, to => 'BD-Uninstallable', action => 'give-back'},
+    };
+    # documentation of flags for the state machine below
+    #
+    # to: new state
+    # from: states the package might have
+    # warnfrom: states the package might also have but generates warnings
+    #
+    # action: action name for logging
+    # nopkgdef: package needs to exist for this
+    # builder: only the user marked as handling this package might do this
+    # noversion: skip the version check below
+    # binversion: use the full (binNMU) version for the version check
+}
+
+sub add_packages {
+    my $s = shift;
+    my $newstate = $s->{'newstate'};
+    my( $package, $name, $version, $ok, $reason );
+
+    foreach $package (@_) {
+        if ($api >= 2) {
+	    my @p = split("/", $package);
+	    # [[arch/]suite/]package_version
+	    $package = $p[-1];
+	    my $suite = $p[-2] if scalar @p > 1;
+	    my $arch = $p[-3] if scalar @p > 2;
+	    # ignore suite, arch for the moment unless arch=all
+	} else {
+            $package =~ s,^.*/,,; # strip path
+	    $package =~ s/\.(dsc|diff\.gz|tar\.gz|deb)$//; # strip extension
+	    $package =~ s/_[a-zA-Z\d-]+\.changes$//; # strip extension
+	}
+        if ($package =~ /^([\w\d.+-]+)_([\w\d:.+~-]+)/) {
+	    ($name,$version) = ($1,$2);
+        } else {
+	    warn "$package: can't extract package name and version (bad format)\n";
+	    next;
+	}
+
+	my $pkg = get_source_info({'name' => $name, 'dist' => $s->{'dist'}, 'arch' => $s->{'arch'}});
+        if (!($actions->{$newstate}) || !($actions->{$newstate}->{'nopkgdef'})) {
+            if (!defined($pkg)) {
+                print "$name: not registered yet.\n";
+                next;
+            }
+        }
+        if ($actions->{$newstate} && $actions->{$newstate}->{'builder'}) {
+            if (($pkg->{'builder'} && $user ne $pkg->{'builder'}) &&
+		!($pkg->{'builder'} =~ /^(\w+)-\w+/ && $1 eq $user) &&
+		!$opt_override) {
+                print "$pkg->{'package'}: not taken by you, but by $pkg->{'builder'}. Skipping.\n";
+                next;
+            }
+        }
+        if (!($actions->{$newstate}) || !($actions->{$newstate}->{'noversion'})) {
+            my $nmuver = binNMU_version($pkg->{version}, $pkg->{'binary_nmu_version'});
+            if ((!pkg_version_eq($pkg,$version) || $actions->{$newstate}->{'binversion'}) && !version_eq( $nmuver, $version )) {
+                print "$pkg->{package}: version mismatch ($nmuver";
+                print " by $pkg->{'builder'}" if $pkg->{'builder'};
+                print ")\n";
+                next;
+            }
+        }
+
+        if ($actions->{$newstate} && $actions->{$newstate}->{'from'}) {
+            if (!isin($pkg->{'state'}, @{$actions->{$newstate}->{'from'}}, @{$actions->{$newstate}->{'warnfrom'}})) {
+                print "$name: skipping: state is $pkg->{'state'}, not in ".join(", ",@{$actions->{$newstate}->{'from'}}, @{$actions->{$newstate}->{'warnfrom'}})."\n";
+                next;
+            }
+        }
+        if ($actions->{$newstate} && $actions->{$newstate}->{'warnfrom'}) {
+            if (isin($pkg->{'state'}, @{$actions->{$newstate}->{'warnfrom'}})) {
+                print "$name: warning: state is $pkg->{'state'}, processing anyways.\n";
+            }
+        }
+
+        if ($newstate eq "building") {
+            add_one_building( {'name' => $name, 'version' => $version, 'pkg' => $pkg, 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}} );
+        }
+        elsif ($newstate eq "failed") {
+	    print "$pkg->{'package'}: already registered as failed; will append new message\n" if $pkg->{'state'} eq "Failed";
+	    $pkg->{'builder'} = $user;
+	    $pkg->{'failed'} .= "\n" if $pkg->{'failed'};
+	    $pkg->{'failed'} .= $fail_reason;
+        }
+        elsif ($newstate eq "not-for-us") {
+            add_one_notforus( {'pkg' => $pkg, 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}} );
+        }
+        elsif ($newstate eq "needs-build") {
+	    my $state = $pkg->{'state'};
+
+	    if ($state eq "BD-Uninstallable") {
+            	if ($opt_override) {
+            		print "$name: Forcing uninstallability mark to be removed. This is not permanent and might be reset with the next trigger run\n";
+
+            		change_state( \$pkg, 'Needs-Build' );
+            		delete $pkg->{'builder'};
+            		delete $pkg->{'depends'};
+            		update_source_info({'pkg' => $pkg, 'action' => "--give-back" , 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}});
+            		print "$name: given back\n" if $verbose;
+            		next;
+            	}
+            	else {
+            		print "$name: has uninstallable build-dependencies. Skipping\n  (use --override to clear dependency list and give back anyway)\n";
+            		next;
+            	}
+            }
+            elsif ($state eq "Dep-Wait") {
+            	if ($opt_override) {
+            		print "$name: Forcing source dependency list to be cleared\n";
+            	}
+            	else {
+            		print "$name: waiting for source dependencies. Skipping\n  (use --override to clear dependency list and give back anyway)\n";
+            		next;
+            	}
+            }
+            elsif (!isin( $state, qw(Building Built Build-Attempted))) {
+            	print "$name: not taken for building (state is $state).";
+            	if ($opt_override) {
+            		print "\n$name: Forcing give-back\n";
+            	}
+            	else {
+            		print " Skipping.\n";
+            		next;
+            	}
+            }
+            $pkg->{'builder'} = undef;
+            $pkg->{'depends'} = undef;
+        }
+        elsif ($newstate eq "dep-wait") {
+            add_one_depwait( $pkg );
+        }
+        elsif ($newstate eq "build-priority") {
+            set_one_buildpri( 'buildpri', {'pkg' => $pkg, 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}} );
+        }
+        elsif ($newstate eq "permanent-build-priority") {
+            set_one_buildpri( 'permbuildpri', {'pkg' => $pkg, 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}} );
+        }
+        elsif ($newstate eq "binary-nmu") {
+            set_one_binnmu( {'name' => $name, 'version' => $version, 'pkg' => $pkg, 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}} );
+        }
+        elsif ($newstate eq "update") {
+            $pkg->{'version'} =~ s/\+b[0-9]+$//;
+
+	    update_source_info({'pkg' => $pkg, 'action' => "--update" , 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}});
+        }
+
+        if ($actions->{$newstate} && $actions->{$newstate}->{'action'} && $actions->{$newstate}->{'to'}) {
+	    change_state( \$pkg, $actions->{$newstate}->{'to'} );
+	    update_source_info( {'pkg' => $pkg, 'action' => "--set-".$actions->{$newstate}->{'action'}, 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}} );
+	    print "$name: registered as ".$actions->{$newstate}->{'action'}."\n" if $verbose;
+        }
+    }
+}
+
+sub add_one_building {
+	my $s = shift;
+	my $pkg = $s->{'pkg'};
+	my( $ok, $reason );
+
+	$ok = 1;
+	if (defined($pkg)) {
+            my $pkgnack = {
+                'Not-For-Us' => 'not suitable for this architecture',
+                'Dep-Wait' => 'not all source dependencies available yet',
+                'BD-Uninstallable' => 'source dependencies are not installable',
+            };
+		if ($pkgnack->{$pkg->{'state'}}) {
+			$ok = 0;
+			$reason = $pkgnack->{$pkg->{'state'}};
+		}
+		elsif ($pkg->{'state'} eq "Uploaded" &&
+			   (version_lesseq($s->{'version'}, $pkg->{'version'}))) {
+			$ok = 0;
+			$reason = "already uploaded by $pkg->{'builder'}";
+			$reason .= " (in newer version $pkg->{'version'})"
+				if !version_eq($pkg, $s->{'version'});
+		}
+		elsif ($pkg->{'state'} eq "Installed" &&
+			   version_less($s->{'version'},$pkg->{'version'})) {
+			if ($opt_override) {
+				print "$s->{'name'}: Warning: newer version $pkg->{'version'} ".
+					  "already installed, but overridden.\n";
+			}
+			else {
+				$ok = 0;
+				$reason = "newer version $pkg->{'version'} already in ".
+						  "archive; doesn't need rebuilding";
+				print "$s->{'name'}: Note: If the following is due to an epoch ",
+					  " change, use --override\n";
+			}
+		}
+		elsif ($pkg->{'state'} eq "Installed" &&
+			   pkg_version_eq($pkg,$s->{'version'})) {
+			$ok = 0;
+			$reason = "is up-to-date in the archive; doesn't need rebuilding";
+		}
+		elsif ($pkg->{'state'} eq "Needs-Build" &&
+			   version_less($s->{'version'},$pkg->{'version'})) {
+			if ($opt_override) {
+				print "$s->{'name'}: Warning: newer version $pkg->{'version'} ".
+					  "needs building, but overridden.";
+			}
+			else {
+				$ok = 0;
+				$reason = "newer version $pkg->{'version'} needs building, ".
+						  "not $s->{'version'}";
+			}
+		}
+		elsif (isin($pkg->{'state'},qw(Building Built Build-Attempted))) {
+			if (version_less($pkg->{'version'},$s->{'version'})) {
+				print "$s->{'name'}: Warning: Older version $pkg->{'version'} ",
+				      "is being built by $pkg->{'builder'}\n";
+			}
+			else {
+				if ($opt_override) {
+					print "User $pkg->{'builder'} had already ",
+					      "taken the following package,\n",
+						  "but overriding this as you request:\n";
+				}
+				elsif ($pkg->{'builder'} eq $user) {
+					print "$s->{'name'}: Note: already taken by you.\n";
+					print "$s->{'name'}: ok\n" if $verbose;
+					return;
+				}
+				else {
+					$ok = 0;
+					$reason = "already taken by $pkg->{'builder'}";
+					$reason .= " (in newer version $pkg->{'version'})"
+						if !version_eq($pkg->{'version'}, $s->{'version'});
+				}
+			}
+		}
+		elsif ($pkg->{'state'} =~ /^Failed/ &&
+			   pkg_version_eq($pkg, $s->{'version'})) {
+			if ($opt_override) {
+				print "The following package previously failed ",
+					  "(by $pkg->{'builder'})\n",
+					  "but overriding this as you request:\n";
+			}
+			else {
+				$ok = 0;
+				$reason = "build of $s->{'version'} failed previously:\n    ";
+				$reason .= join( "\n    ", split( "\n", $pkg->{'failed'} ));
+				$reason .= "\nalso the package doesn't need builing"
+					if $pkg->{'state'} eq 'Failed-Removed';
+			}
+		}
+	}
+	if ($ok) {
+            if ($api < 1) {
+		my $ok = 'ok';
+		if ($pkg->{'binary_nmu_version'}) {
+			print "$s->{'name'}: Warning: needs binary NMU $pkg->{'binary_nmu_version'}\n" .
+			      "$pkg->{'binary_nmu_changelog'}\n";
+			$ok = 'aok';
+		} else {
+			print "$s->{'name'}: Warning: Previous version failed!\n"
+				if $pkg->{'previous_state'} =~ /^Failed/ ||
+				   $pkg->{'state'} =~ /^Failed/;
+		}
+		print "$s->{'name'}: $ok\n" if $verbose;
+            } else {
+                my @buildinfo;
+                push @buildinfo, {'status' => 'ok'};
+                push @buildinfo, {'pkg-ver' => $s->{'name'}."_".$s->{'version'}};
+                push @buildinfo, {'suite' => $s->{'dist'}};
+                push @buildinfo, {'arch' => $s->{'arch'}};
+                push @buildinfo, {'binNMU' => $pkg->{'binary_nmu_version'}} if $pkg->{'binary_nmu_version'};
+                push @buildinfo, {'extra-changelog' => $pkg->{'binary_nmu_changelog'}} if $pkg->{'binary_nmu_changelog'} && $pkg->{'binary_nmu_version'};
+                push @buildinfo, {'extra-depends' => $pkg->{'extra_depends'}} if $pkg->{'extra_depends'};
+                push @buildinfo, {'extra-conflicts' => $pkg->{'extra_conflicts'}} if $pkg->{'extra_conflicts'};
+                push @buildinfo, {'archive' => $distribution_architectures{$s->{'dist'}}{$s->{'arch'}}->{'archive'}} if $distribution_architectures{$s->{'dist'}}{$s->{'arch'}}->{'archive'};
+                push @buildinfo, {'build_dep_resolver' => $distributions{$s->{'dist'}}->{'build_dep_resolver'}} if $distributions{$s->{'dist'}}->{'build_dep_resolver'};
+                push @buildinfo, {'suppress_successful_logs' => $distributions{$s->{'dist'}}->{'suppress_successful_logs'}} if $distributions{$s->{'dist'}}->{'suppress_successful_logs'};
+                push @buildinfo, {'mail_logs' => $distributions{$s->{'dist'}}->{'mail_logs'}} if $distributions{$s->{'dist'}}->{'mail_logs'};
+                print YAML::Tiny::Dump[{$s->{'name'} => [@buildinfo]}];
+            }
+		change_state( \$pkg, 'Building' );
+		$pkg->{'package'} = $s->{'name'};
+		$pkg->{'version'} = $s->{'version'};
+		$pkg->{'builder'} = $user;
+		update_source_info({'pkg' => $pkg, 'action' => "--take" , 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}});
+	}
+	else {
+            if ($api < 1) {
+		print "$s->{'name'}: NOT OK!\n  $reason\n";
+            } else {
+		print "- $s->{'name'}:\n    - status: not ok\n    - reason: \"$reason\"\n";
+            }
+	}
+}
+
+
+sub add_one_notforus {
+	my $s = shift;
+	my $pkg = $s->{'pkg'};
+	my $state = $pkg->{'state'};
+        my $name = $pkg->{'package'};
+	my $action;
+
+	if ($pkg->{'state'} eq 'Not-For-Us') {
+		# reset Not-For-Us state in case it's called twice; this is
+		# the only way to get a package out of this state...
+		# There is no really good state in which such packages should
+		# be put :-( So use Failed for now.
+		change_state( \$pkg, 'Failed' );
+		$pkg->{'package'} = $name;
+		$pkg->{'failed'} = "Was Not-For-Us previously";
+		delete $pkg->{'builder'};
+		delete $pkg->{'depends'};
+		$action = "--no-build(rev)";
+		print "$name: now not unsuitable anymore\n" if $verbose;
+
+		send_mail( $conf::notforus_maint,
+				   "$name moved out of Not-For-Us state",
+				   "The package '$name' has been moved out of the Not-For-Us ".
+				   "state by $user.\n".
+				   "It should probably also be removed from ".
+				   "Packages-arch-specific or\n".
+				   "the action was wrong.\n" )
+			if $conf::notforus_maint;
+	}
+	else {
+		change_state( \$pkg, 'Not-For-Us' );
+		$pkg->{'package'} = $name;
+		delete $pkg->{'builder'};
+		delete $pkg->{'depends'};
+		delete $pkg->{'binary_nmu_version'};
+		delete $pkg->{'binary_nmu_changelog'};
+		$action = "--no-build";
+		print "$name: registered as unsuitable\n" if $verbose;
+
+		send_mail( $conf::notforus_maint,
+				   "$name set to Not-For-Us",
+				   "The package '$name' has been set to state Not-For-Us ".
+				   "by $user.\n".
+				   "It should probably also be added to ".
+				   "Packages-arch-specific or\n".
+				   "the Not-For-Us state is wrong.\n" )
+			if $conf::notforus_maint;
+	}
+	update_source_info({'pkg' => $pkg, 'action' => $action, 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}});
+}
+
+sub set_one_binnmu {
+	my $s = shift;
+	my $name = $s->{'name'};
+	my $version = $s->{'version'};
+	my $pkg = $s->{'pkg'};
+	my $state = $pkg->{'state'};
+
+	if (defined $pkg->{'binary_nmu_version'}) {
+		if ($binNMUver == 0) {
+			change_state( \$pkg, 'Installed' );
+			delete $pkg->{'builder'};
+			delete $pkg->{'depends'};
+			delete $pkg->{'binary_nmu_version'};
+			delete $pkg->{'binary_nmu_changelog'};
+                        delete $pkg->{'buildpri'};
+		} elsif ($binNMUver <= $pkg->{'binary_nmu_version'}) {
+			print "$name: already building binNMU $pkg->{'binary_nmu_version'}\n";
+			return;
+		} else {
+			$pkg->{'binary_nmu_version'} = $binNMUver;
+			$pkg->{'binary_nmu_changelog'} = $fail_reason;
+			$pkg->{'notes'} = 'out-of-date';
+                        delete $pkg->{'buildpri'};
+			change_state( \$pkg, 'BD-Uninstallable' );
+		}
+		update_source_info({'pkg' => $pkg, 'action' => "--binNMU" , 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}});
+		return;
+	} elsif ($binNMUver == 0) {
+                print "${name}_$version: no scheduled binNMU to cancel.\n";
+                return;
+        }
+
+	if ($state ne 'Installed' && !$opt_override) {
+		print "${name}_$version: not installed; can't register for binNMU.\n";
+		return;
+	}
+
+	my $fullver = binNMU_version($version,$binNMUver);
+	if ( version_lesseq( $fullver, $pkg->{'installed_version'} ) )
+	{
+		print "$name: binNMU $fullver is not newer than current version $pkg->{'installed_version'}\n";
+		return;
+	}
+
+	change_state( \$pkg, 'BD-Uninstallable' );
+	delete $pkg->{'builder'};
+	delete $pkg->{'depends'};
+	$pkg->{'binary_nmu_version'} = $binNMUver;
+	$pkg->{'binary_nmu_changelog'} = $fail_reason;
+	$pkg->{'notes'} = 'out-of-date';
+        delete $pkg->{'buildpri'};
+	update_source_info({'pkg' => $pkg, 'action' => "--binNMU" , 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}});
+	print "${name}: registered for binNMU $fullver\n" if $verbose;
+}
+
+sub set_one_buildpri {
+	my $key = shift;
+	my $s = shift;
+	my $pkg = $s->{'pkg'};
+        my $name = $pkg->{'package'};
+
+	if ( $build_priority ) {
+		$pkg->{$key} = $build_priority;
+	} else {
+		delete $pkg->{$key};
+	}
+	update_source_info({'pkg' => $pkg, 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}});
+	print "$name: set to build priority $build_priority\n" if $verbose;
+}
+
+sub add_one_depwait {
+	my $pkg = shift;
+	my $state = $pkg->{'state'};
+        my $name = $pkg->{'package'};
+
+	if ($state eq "Dep-Wait") {
+		print "$name: merging with previously registered dependencies\n";
+	}
+	
+	if (isin( $state, qw<Installed Not-For-Us>)) {
+            print "add_one_depwait: $name: skipping in state $state\n";
+            return;
+        }
+        
+	if ($fail_reason =~ /^\s*$/ ||
+		   !parse_deplist( $fail_reason, 1 )) {
+		print "$name: Bad dependency list\n";
+		return;
+	}
+	change_state( \$pkg, 'Dep-Wait' );
+	$pkg->{'builder'} = $user;
+	my $deplist = parse_deplist( $pkg->{'depends'} );
+	my $new_deplist = parse_deplist( $fail_reason );
+	# add new dependencies, maybe overwriting old entries
+	foreach (keys %$new_deplist) {
+		$deplist->{$_} = $new_deplist->{$_};
+	}
+	$pkg->{'depends'} = build_deplist($deplist);
+	update_source_info({'pkg' => $pkg, 'action' => "--dep-wait" , 'arch' => $arch, 'dist' => $distribution});
+	print "$name: registered as waiting for dependencies\n" if $verbose || $simulate;
+}
+
+
+# for sorting priorities and sections
+BEGIN {
+	%prioval = ( required             => -5,
+				 important            => -4,
+				 standard             => -3,
+				 optional             => -2,
+				 extra                => -1,
+				 unknown              => -1 );
+	%sectval = ( 
+				 libs			=> -200,
+				 'debian-installer'	=> -199,
+				 base			=> -198,
+				 devel			=> -197,
+				 kernel			=> -196,
+				 shells			=> -195,
+				 perl			=> -194,
+				 python			=> -193,
+				 graphics		=> -192,
+				 admin			=> -191,
+				 utils			=> -190,
+				 x11			=> -189,
+				 editors		=> -188,
+				 net			=> -187,
+				 httpd			=> -186,
+				 mail			=> -185,
+				 news			=> -184,
+				 tex			=> -183,
+				 text			=> -182,
+				 web			=> -181,
+				 vcs			=> -180,
+				 doc			=> -179,
+				 localizations		=> -178,
+				 interpreters		=> -177,
+				 ruby			=> -176,
+				 java			=> -175,
+				 ocaml			=> -174,
+				 lisp			=> -173,
+				 haskell		=> -172,
+				 'cli-mono'             => -171,
+				 gnome			=> -170,
+				 kde			=> -169,
+				 xfce			=> -168,
+				 gnustep		=> -167,
+				 database		=> -166,
+				 video			=> -165,
+				 debug			=> -164,
+				 games			=> -163,
+				 misc			=> -162,
+				 fonts			=> -161,
+				 otherosfs		=> -160,
+				 oldlibs		=> -159,
+				 libdevel		=> -158,
+				 sound			=> -157,
+				 math			=> -156,
+				 'gnu-r'		=> -155,
+				 science		=> -154,
+				 comm			=> -153,
+				 electronics		=> -152,
+				 hamradio		=> -151,
+				 embedded		=> -150,
+				 php			=> -149,
+				 zope			=> -148,
+	);
+	foreach my $i (keys %sectval) {
+		$sectval{"contrib/$i"} = $sectval{$i}+40;
+		$sectval{"non-free/$i"} = $sectval{$i}+80;
+	}
+	$sectval{'unknown'}	= -165;
+
+}
+
+sub sort_list_func {
+    my $map_funcs = {
+        'C' => ['<->', sub { return $_[0]->{'calprio'}; }],
+        'W' => ['<->', sub { return $_[0]->{'state_days'}; }],
+        'P' => ['<->', sub { return ($_[0]->{'buildpri'}//0) + ($_[0]->{'permbuildpri'}//0); }],
+        'p' => ['<=>', sub { return $prioval{$_[0]->{'priority'}//""}//0; }],
+        's' => ['<=>', sub { return $sectval{$_[0]->{'section'}//""}//0; }],
+        'n' => ['cmp', sub { return $_[0]->{'package'}; }],
+        'b' => ['cmp', sub { return $_[0]->{'builder'}; }],
+        'c' => ['<=>', sub { return ($_[0]->{'notes'}//"" =~ /^(out-of-date|partial)/) ? 0: ($_[0]->{'notes'}//"" =~ /^uncompiled/) ? 2 : 1; }],
+        'S' => ['<->', sub { return isin($_[0]->{'priority'}, qw(required important standard)); }],
+        'T' => ['<->', sub { return $_[0]->{'state_time'} % 86400;} ], # Fractions of a day
+    };
+
+	foreach my $letter (split( //, $list_order )) {
+            my $r;
+            $r = (&{$map_funcs->{$letter}[1]}($b)//0 ) <=> (&{$map_funcs->{$letter}[1]}($a)//0 ) if $map_funcs->{$letter}[0] eq '<->';
+            $r = (&{$map_funcs->{$letter}[1]}($a)//0 ) <=> (&{$map_funcs->{$letter}[1]}($b)//0 ) if $map_funcs->{$letter}[0] eq '<=>';
+            $r = (&{$map_funcs->{$letter}[1]}($a)//"") cmp (&{$map_funcs->{$letter}[1]}($b)//"") if $map_funcs->{$letter}[0] eq 'cmp';
+            return $r if $r != 0;
+	}
+	return 0;
+}
+
+sub calculate_prio {
+	my $priomap = $yamlmap->{priority};
+	my $pkg = shift;
+        my @s=split("/", $pkg->{'section'}//"");
+        $pkg->{'component'} = $s[0] if $s[1];
+        $pkg->{'component'} ||= 'main';
+	$pkg->{'calprio'} = 0;
+	foreach my $k (keys %{$priomap->{keys}}) {
+		$pkg->{'calprio'} += $priomap->{keys}->{$k}{$pkg->{$k}} if $pkg->{$k} and $priomap->{keys}->{$k}{$pkg->{$k}};
+	}
+
+	my $days = $pkg->{'state_days'};
+	$days = $priomap->{'waitingdays'}->{'min'} if $priomap->{'waitingdays'}->{'min'} and $days < $priomap->{'waitingdays'}->{'min'};
+	$days = $priomap->{'waitingdays'}->{'max'} if $priomap->{'waitingdays'}->{'max'} and $days > $priomap->{'waitingdays'}->{'max'};
+	my $scale = $priomap->{'waitingdays'}->{'scale'} || 1;
+	$pkg->{'calprio'} += $days * $scale;
+
+        my $btime = max($pkg->{'anytime'}//0, $pkg->{'successtime'}//0);
+        my $bhours = $btime ? int($btime/3600) : ($priomap->{'buildhours'}->{'default'} || 2);
+	$bhours = $priomap->{'buildhours'}->{'min'} if $priomap->{'buildhours'}->{'min'} and $bhours < $priomap->{'buildhours'}->{'min'};
+	$bhours = $priomap->{'buildhours'}->{'max'} if $priomap->{'buildhours'}->{'max'} and $bhours > $priomap->{'buildhours'}->{'max'};
+	$scale = $priomap->{'buildhours'}->{'scale'} || 1;
+        $pkg->{'calprio'} -= $bhours * $scale;
+
+	$pkg->{'calprio'} += $pkg->{'permbuildpri'} if  $pkg->{'permbuildpri'};
+	$pkg->{'calprio'} += $pkg->{'buildpri'} if  $pkg->{'buildpri'};
+
+	return $pkg;
+}
+
+
+sub seconds2time {
+    my $t = shift;
+    return "" unless $t;
+    my $sec = $t % 60;
+    my $min = int($t/60) % 60;
+    my $hours = int($t / 3600);
+    return sprintf("%d:%02d:%02d", $hours, $min, $sec) if $hours;
+    return sprintf("%d:%02d", $min, $sec);
+}
+
+
+sub use_fmt {
+    my $r;
+
+    if (ref($_[0]) eq 'CODE') {
+        $r = &{$_[0]};
+    } else {
+        $r = $_[0];
+    }
+
+    shift;
+    my $t = shift;
+
+    $r ||= "";
+    return $r unless $t;
+
+    my $pkg = shift;
+    my $var = shift;
+    if (substr($t,0,1) eq '!') {
+        $t = substr($t,1);
+        return "" if $r;
+    } else {
+        return "" unless $r;
+    }
+    if ($t =~ /%/) {
+        return print_format($t, $pkg, $var);
+    }
+    return $t;
+}
+sub make_fmt { my $c = shift; my $pkg = shift; my $var = shift; return sub { use_fmt($c, $_[0], $pkg, $var); } };
+
+sub print_format {
+    my $printfmt = shift;
+    my $pkg = shift;
+    my $var = shift;
+
+=pod
+
+Within an format string, the following values are allowed (need to be preceded by %).
+This can be combined to e.g.
+wanna-build --format='wanna-build -A %a --give-back %p_%v' -A mipsel --list=failed
+
+a Architecture
+c section (e.g. libs or utils)
+D in case of BD-Uninstallable the reason for the uninstallability
+d distribution
+E in case of Dep-Wait the packages being waited on, in case of Needs-Build the number in the queue
+F in case of Failed the fail reason
+n newline
+o time of last successful build (seconds)
+O time of last successful build (formated)
+P previous state
+p Package name
+q time of last build (seconds)
+Q time of last build (formated)
+r max time of last (successful) build (seconds)
+R max time of last (successful) build (formated)
+S Package state
+s Time in this state in full seconds since epoch
+t time of state change
+T time since state change
+u Builder (e.g. buildd_mipsel-rem)
+v Package version
+V full Package version (i.e. with +b.., = %v%{+b}B%B
+X the string normally between [], e.g. optional:out-of-date:calprio{61}:days{25}
+
+%{Text}?  print Text in case ? is not empty; ? is never printed
+%{!Text}? print Text in case ? is empty; ? is never printed
+Text could contain further %. To start with !, use %!
+
+=cut
+
+    return stringf($printfmt, (
+        'p' => make_fmt( $pkg->{'package'}, $pkg, $var),
+        'a' => make_fmt( $arch, $pkg, $var),
+        's' => make_fmt( sub { return floor(str2time($pkg->{'state_change'})); }, $pkg, $var),
+        'v' => make_fmt( $pkg->{'version'}, $pkg, $var),
+        'V' => make_fmt( sub { $pkg->{'binary_nmu_version'} ? $pkg->{'version'}."+b".$pkg->{'binary_nmu_version'} : $pkg->{'version'} }, $pkg, $var),
+        'S' => make_fmt( $pkg->{'state'}, $pkg, $var),
+        'u' => make_fmt( $pkg->{'builder'}, $pkg, $var),
+        'X' => make_fmt( sub {
+            no warnings;
+            my $c = "$pkg->{'priority'}:$pkg->{'notes'}";
+            $c .= ":PREV-FAILED" if $pkg->{'previous_state'} && $pkg->{'previous_state'} =~ /^Failed/;
+            $c .= ":bp{" . (($pkg->{'buildpri'}//0)+($pkg->{'permbuildpri'}//0)) . "}" if (($pkg->{'buildpri'}//0)+($pkg->{'permbuildpri'}//0));
+            $c .= ":binNMU{" . $pkg->{'binary_nmu_version'} . "}" if defined $pkg->{'binary_nmu_version'};
+            $c .= ":calprio{". $pkg->{'calprio'}."}";
+            $c .= ":days{". $pkg->{'state_days'}."}";
+            return $c;
+            }, $pkg, $var),
+        'c' => make_fmt( $pkg->{'section'}, $pkg, $var),
+        'P' => make_fmt( $pkg->{'previous_state'} || "unknwon", $pkg, $var),
+        'E' => make_fmt( sub { return $pkg->{'depends'} if $pkg->{'state'} eq "Dep-Wait";
+            return $var->{scnt}{'Needs-Build'} + 1 if $pkg->{'state'} eq 'Needs-Build';
+            return ""; }, $pkg, $var),
+	'F' => make_fmt( sub { return "" unless $pkg->{'failed'};
+	    my $failed = $pkg->{'failed'};
+	    $failed =~ s/\\/\\\\/g;
+            return $pkg->{'package'}."#".$arch."-failure\n ".
+	    join("\\0a",split("\n",$failed))."\\0a\n"; }, $pkg, $var),
+        'D' => make_fmt( sub { return "" unless $pkg->{'bd_problem'};
+            return $pkg->{'package'}."#".$arch."-bd-problem\n".
+            join("\\0a",split("\n",$pkg->{'bd_problem'}))."\\0a\n"; }, $pkg, $var),
+        'B' => make_fmt( sub { return $pkg->{'binary_nmu_version'} if defined $pkg->{'binary_nmu_version'}; }, $pkg, $var),
+        'd' => make_fmt( $pkg->{'distribution'}, $pkg, $var),
+        't' => make_fmt( $pkg->{'state_change'}, $pkg, $var),
+        'T' => make_fmt( sub { return seconds2time(time() - floor(str2time($pkg->{'state_change'}))); }, $pkg, $var),
+        'o' => make_fmt( $pkg->{'successtime'}, $pkg, $var),
+        'O' => make_fmt( sub { return seconds2time ( $pkg->{'successtime'}); }, $pkg, $var),
+        'q' => make_fmt( $pkg->{'anytime'}, $pkg, $var),
+        'Q' => make_fmt( sub { return seconds2time ( $pkg->{'anytime'}); }, $pkg, $var),
+        'r' => make_fmt( sub { my $c = max($pkg->{'successtime'}//0, $pkg->{'anytime'}//0); return $c if $c; return; }, $pkg, $var),
+        'R' => make_fmt( sub { return seconds2time ( max($pkg->{'successtime'}//0, $pkg->{'anytime'}//0)); }, $pkg, $var),
+    ));
+}
+
+sub list_packages {
+	my $s = shift;
+	my @list;
+	my $cnt = 0;
+	my %scnt;
+	my $ctime = time;
+
+ 	my $db = get_all_source_info(state => $s->{'state'}, user => $user, list_min_age => $list_min_age, list_max_age => $list_max_age, multisuite => 1);
+	foreach my $key (keys %$db) {
+		next if $key =~ /^_/;
+		push @list, calculate_prio($db->{$key});
+	}
+
+        # filter components
+        @list = grep { my $i = $_->{'component'}; grep { $i eq $_ } split /[, ]+/, $yamlmap->{"restrict"}{'component'} } @list;
+        # extra depends / conflicts only from api 1 on
+        @list = grep { !$_->{'extra_depends'} and !$_->{'extra_conflicts'} } @list if $api < 1 ;
+        # filter out packages for needs-build in noautobuild state - same could exist for weaknoautobuild if buildds would tell us what they do
+        if (($s->{'state'} eq 'needs-build') && ($yamlmap->{"restrict"}) && ($yamlmap->{"restrict"}{"noautobuild"})) {
+            foreach my $key (map {keys %$_} @{$yamlmap->{"restrict"}{"noautobuild"}}) {
+                @list = grep { $_->{'package'} ne $key } @list;
+            }
+        }
+
+        # first adjust ownprintformat, then set printformat accordingly
+        $printformat ||= $yamlmap->{"format"}{$ownprintformat} if $ownprintformat;
+        $printformat ||= $yamlmap->{"format"}{"default"}{$s->{'state'}};
+        $printformat ||= $yamlmap->{"format"}{"default"}{"default"};
+        undef $printformat if ($ownprintformat && $ownprintformat eq 'none');
+
+	$printformat ||="%a/%d/%p_%v [%X]" if $api >= 2 and $s->{'state'} eq 'needs-build';
+
+	foreach my $pkg (sort sort_list_func @list) {
+                no warnings;
+                if ($printformat) {
+                    print print_format($printformat, $pkg, {'cnt' => $cnt, 'scnt' => \%scnt})."\n";
+		    ++$cnt;
+		    $scnt{$pkg->{'state'}}++;
+                    next;
+                }
+		print print_format("%c/%p_%v", $pkg, {});
+		print print_format(": %S", $pkg, {})
+			if $s->{'state'} eq "all";
+		print print_format("%{ by }u%u", $pkg, {})
+			if $pkg->{'state'} ne "Needs-Build";
+		print print_format(" [%X]\n", $pkg, {});
+		print "  Reasons for failing:\n",
+			  join("\n    ",split("\n",$pkg->{'failed'})), "\n"
+			if $pkg->{'state'} =~ /^Failed/;
+		print "  Dependencies: $pkg->{'depends'}\n"
+			if $pkg->{'state'} eq "Dep-Wait";
+		print "  Reasons for BD-Uninstallable:\n    ",
+		          join("\n    ",split("\n",$pkg->{'bd_problem'})), "\n"
+			if $pkg->{'state'} eq "BD-Uninstallable";
+		print "  Previous state was $pkg->{'previous_state'}\n"
+			if $verbose && $pkg->{'previous_state'};
+		print "  No previous state recorded\n"
+			if $verbose && !$pkg->{'previous_state'};
+		print "  State changed at $pkg->{'state_change'}\n"
+			if $verbose && $pkg->{'state_change'};
+		print "  Previous state $pkg->{'previous_state'} left $pkg->{'state_time'} ago\n"
+			if $verbose && $pkg->{'previous_state'};
+		print "  Previous failing reasons:\n    ",
+		      join("\n    ",split("\n",$pkg->{'old_failed'})), "\n"
+			if $verbose && $pkg->{'old_failed'};
+		++$cnt;
+		$scnt{$pkg->{'state'}}++ if $s->{'state'} eq "all";
+	}
+	if ($s->{'state'} eq "all" && !$printformat) {
+		foreach (sort keys %scnt) {
+			print "Total $scnt{$_} package(s) in state $_.\n";
+		}
+	}
+	print "Total $cnt package(s)\n" unless $printformat;
+	
+}
+
+sub info_packages {
+	my $s = shift;
+	my( $name, $pkg, $key, $dist );
+	my @firstkeys = qw(package version builder state section priority
+					   installed_version previous_state state_change);
+	my @dists = $info_all_dists ? keys %distributions : ($s->{'dist'});
+	my %beautykeys = ( 'package' => 'Package', 'version' => 'Version', 'builder' => 'Builder',
+		'state' => 'State', 'section' => 'Section', 'priority' => 'Priority',
+		'installed_version' => 'Installed-Version', 'previous_state' => 'Previous-State',
+		'state_change' => 'State-Change',
+		'bd_problem' => 'BD-Problem', 
+		'binary_nmu_changelog' => 'Binary-NMU-Changelog', 'binary_nmu_version' => 'Binary-NMU-Version',
+		'buildpri' => 'BuildPri', 'depends' => 'Depends', 'failed' => 'Failed',
+		'notes' => 'Notes',
+		'distribution' => 'Distribution', 'old_failed' => 'Old-Failed',
+		'permbuildpri' => 'PermBuildPri', 'rel' => 'Rel',
+		'calprio' => 'CalculatedPri', 'state_days' => 'State-Days', 'state_time' => 'State-Time',
+                'successtime' => 'Success-build-time',
+                'anytime' => 'Build-time',
+                'extra_depends' => 'Extra-Dependencies',
+                'extra_conflicts' => 'Extra-Conflicts',
+			 );
+	
+	foreach $name (@_) {
+		$name =~ s/_.*$//; # strip version
+		foreach $dist (@dists) {
+			my $pname = "$name" . ($info_all_dists ? "($dist)" : "");
+			
+			$pkg = get_readonly_source_info({'name' => $name, 'dist' => $s->{'dist'}, 'arch' => $s->{'arch'}});
+			if (!defined( $pkg )) {
+				print "$pname: not registered\n";
+				next;
+			}
+			$pkg = calculate_prio($pkg);
+
+			print "$pname:\n";
+			foreach $key (@firstkeys) {
+				next if !defined $pkg->{$key};
+				my $val = $pkg->{$key};
+				chomp( $val );
+				$val = "\n$val" if isin( $key, qw(Failed Old-Failed));
+				$val =~ s/\n/\n    /g;
+				my $print_key = $key;
+				$print_key = $beautykeys{$print_key} if $beautykeys{$print_key};
+				printf "  %-20s: %s\n", $print_key, $val;
+			}
+			foreach $key (sort keys %$pkg) {
+				next if isin( $key, @firstkeys );
+				my $val = $pkg->{$key};
+				next if !defined($val);
+				chomp( $val );
+				$val = "\n$val" if isin( $key, qw(Failed Old-Failed));
+				$val =~ s/\n/\n    /g;
+				my $print_key = $key;
+				$print_key = $beautykeys{$print_key} if $beautykeys{$print_key};
+				printf "  %-20s: %s\n", $print_key, $val;
+			}
+		}
+	}
+}
+
+sub forget_packages {
+	my $s = shift;
+	foreach my $name (@_) {
+		$name =~ s/_.*$//; # strip version
+		my $pkg = get_source_info({'name' => $name, 'dist' => $s->{'dist'}, 'arch' => $s->{'arch'}});
+		if (!defined( $pkg )) {
+			print "$name: not registered\n";
+			next;
+		}
+
+		my $data = 
+		    join( "\n", map { 
+			my $val = $pkg->{$_} || "";
+			chomp $val;
+			$val =~ s/\n/\n /g;
+			sprintf "  %-20s: %s", $_, $val
+		    } keys %$pkg );
+		send_mail( $conf::db_maint,
+				   "$name deleted from DB " . table_name('packages', $s->{'arch'}) . " " . $s->{'dist'},
+				   "The package '$name' has been deleted from the database ".
+				   "by $user.\n\n".
+				   "Data registered about the deleted package:\n".
+				   "$data\n" ) if $conf::db_maint;
+		change_state( \$pkg, 'deleted' );
+		del_source_info({'pkg' => $pkg, 'action' => "--forget" , 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}});
+		print "$name: deleted from database\n" if $verbose;
+	}
+}
+
+sub forget_users {
+	my $s = shift;
+	$dbh->do("DELETE from " . table_name('users', $s->{'arch'}) . 
+		" WHERE distribution = ?", undef, $s->{'dist'}) or die $dbh->errstr;
+}
+
+sub read_db {
+	my $file = shift;
+
+	print "Reading ASCII database from $file..." if $verbose >= 1;
+	open( my $fh, '<', $file ) or
+		die "Can't open database $file: $!\n";
+
+	local($/) = ""; # read in paragraph mode
+	while( <$fh> ) {
+		my( %thispkg, $name );
+		s/[\s\n]+$//;
+		s/\n[ \t]+/\376\377/g;  # fix continuation lines
+		s/\376\377\s*\376\377/\376\377/og;
+  
+		while( /^(\S+):[ \t]*(.*)[ \t]*$/mg ) {
+			my ($key, $val) = ($1, $2);
+			$key =~ s/-/_/g;
+			$key =~ tr/A-Z/a-z/;
+			$val =~ s/\376\377/\n/g;
+			$thispkg{$key} = $val;
+		}
+		check_entry( \%thispkg );
+		# add to db
+		if (exists($thispkg{'package'})) {
+			update_source_info({'pkg' => \%thispkg, 'arch' => $arch, 'dist' => $distribution});
+		}
+		elsif(exists($thispkg{'user'})) {
+			# user in import, username in database.
+			$dbh->do('INSERT INTO ' . table_name('users', $arch) .
+					' (username, distribution, last_seen)' .
+					' values (?, ?, ?)',
+				undef, $thispkg{'user'}, $distribution,
+				$thispkg{'last_seen'})
+				or die $dbh->errstr;
+		 }
+	}
+	close( $fh );
+	print "done\n" if $verbose >= 1;
+}
+
+sub check_entry {
+	my $pkg = shift;
+	my $field;
+
+	# check for required fields
+	if (exists $pkg->{'user'}) {
+		return;
+	}
+	if (!exists $pkg->{'package'}) {
+		print STDERR "Bad entry: ",
+			  join( "\n", map { "$_: $pkg->{$_}" } keys %$pkg ), "\n";
+		die "Database entry lacks package or username field\n";
+	}
+	# if no State: field, generate one (for old db compat)
+	if (!exists($pkg->{'state'})) {
+		$pkg->{'state'} =
+			exists $pkg->{'failed'} ? 'Failed' : 'Building';
+	}
+	if (!exists $pkg->{'version'} and $pkg->{'state'} ne 'Not-For-Us') {
+		die "Database entry for $pkg->{'package'} lacks Version: field\n";
+	}
+	# check state field
+	die "Bad state $pkg->{'state'} of package $pkg->{Package}\n"
+		if !isin( $pkg->{'state'},
+				  qw(Needs-Build Building Built Build-Attempted Uploaded Installed Dep-Wait Dep-Wait-Removed
+					 Failed Failed-Removed Not-For-Us BD-Uninstallable Auto-Not-For-Us
+					 ) );
+}
+
+sub export_db {
+	my $file = shift;
+	my($name,$pkg,$key);
+
+	print "Writing ASCII database to $file..." if $verbose >= 1;
+	open( my $fh, '>', $file ) or
+		die "Can't open export $file: $!\n";
+
+        my $db = get_all_source_info();
+        foreach $name (sort keys %$db) {
+		next if $name =~ /^_/;
+		my $pkg = $db->{$name};
+		foreach $key (sort keys %{$pkg}) {
+			my $val = $pkg->{$key};
+			next if !defined($val);
+			$val =~ s/\n*$//;
+			$val =~ s/^/ /mg;
+			$val =~ s/^ +$/ ./mg;
+			print $fh "$key: $val\n";
+		}
+		print $fh "\n";
+       }
+       close( $fh );
+       print "done\n" if $verbose >= 1;
+}
+
+sub change_state {
+	my $pkgr = shift;
+	my $pkg = $$pkgr;
+	my $newstate = shift;
+	my $state = \$pkg->{'state'};
+	
+        $newstate = 'Needs-Build' if $newstate eq 'BD-Uninstallable' && $distributions{$distribution}{noadw};
+	return if defined($$state) and $$state eq $newstate;
+        $pkg->{'previous_state'} = $$state if defined($$state);
+	$pkg->{'state_change'} = $curr_date;
+	$pkg->{'do_state_change'} = 1;
+
+	if (defined($$state) and $$state eq 'Failed') {
+		$pkg->{'old_failed'} =
+			"-"x20 . " $pkg->{'version'} " . "-"x20 . "\n" .
+			($pkg->{'failed'} // ""). "\n" .
+			($pkg->{'old_failed'} // "");
+		delete $pkg->{'failed'};
+	}
+	delete $pkg->{'bd_problem'} if ($$state//"") eq 'BD-Uninstallable';
+        $pkg->{'bd_problem'} = "Installability of build dependencies not tested yet" if $newstate eq 'BD-Uninstallable';
+	$$state = $newstate;
+}
+
+sub log_ta {
+        my $s = shift;
+        my $pkg = $s->{'pkg'};
+        my $action = $s->{'action'};
+        my $dist = $s->{'dist'} || $distribution;
+	my $str;
+	my $prevstate;
+
+	$prevstate = $pkg->{'previous_state'} || "(none)";
+	$str = "$action($dist): $pkg->{'package'}_$pkg->{'version'} ".
+		   "changed from $prevstate to $pkg->{'state'} ".
+		   "by $real_user as $user";
+	
+        if ($simulate) {
+            printf "update transactions: %s %s %s %s %s %s %s %s %s %s\n",
+		$pkg->{'package'}, $dist, $s->{'arch'},
+		$pkg->{'version'}, $action, $prevstate, $pkg->{'state'},
+		table_name('transactions', $s->{arch}),
+                $real_user, $user;
+            return;
+        }
+	$dbh->do('INSERT INTO ' . table_name('transactions', $s->{arch}) .
+			' (package, distribution, version, action, ' .
+			' prevstate, state, real_user, set_user, time) ' .
+			' values (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+		undef, $pkg->{'package'}, $dist,
+		$pkg->{'version'}, $action, $prevstate, $pkg->{'state'},
+		$real_user, $user, 'now()') or die $dbh->errstr;
+
+	if (!($prevstate eq 'Failed' && $pkg->{'state'} eq 'Failed')) {
+		$str .= " (with --override)"
+			if $opt_override;
+		$mail_logs .= "$str\n";
+	}
+}
+
+
+sub send_mail {
+	return if $simulate;
+	my $to = shift;
+	my $subject = shift;
+	my $text = shift;
+
+	my $from = $conf::db_maint;
+	my $domain = $conf::buildd_domain;
+
+	$from .= "\@$domain" if $from !~ /\@/;
+
+	$to .= '@' . $domain if $to !~ /\@/;
+	$text =~ s/^\.$/../mg;
+	local $SIG{'PIPE'} = 'IGNORE';
+	open( my $pipe,  '|-', "$conf::mailprog -oem $to" )
+		or die "Can't open pipe to $conf::mailprog: $!\n";
+	chomp $text;
+	print $pipe "From: $from\n";
+	print $pipe "Subject: $subject\n\n";
+	print $pipe "$text\n";
+	close( $pipe );
+}
+
+# for parsing input to dep-wait
+sub parse_deplist {
+    my $deps = shift;
+    my $verify = shift;
+    my %result;
+    
+    return $verify ? 0 : \%result unless $deps;
+    foreach (split( /\s*,\s*/, $deps )) {
+        if ($verify) {
+            # verification requires > starting prompts, no | crap
+            if (!/^(\S+)\s*(\(\s*(>(?:[>=])?)\s*(\S+)\s*\))?\s*$/) {
+                return 0;
+            }
+            next;
+        }
+        my @alts = split( /\s*\|\s*/, $_ );
+        # Anything with an | is ignored, as it can be configured on a
+        # per-buildd basis what will be installed
+        next if $#alts != 0;
+        $_ = shift @alts;
+
+        if (!/^(\S+)\s*(\(\s*(>=|=|==|>|>>|<<|<=)\s*(\S+)\s*\))?\s*$/) {
+            warn( "parse_deplist: bad dependency $_\n" );
+            next;
+        }
+        my($dep, $rel, $relv) = ($1, $3, $4);
+        $rel = ">>" if defined($rel) and $rel eq ">";
+        $result{$dep}->{'package'} = $dep;
+        if ($rel && $relv) {
+            $result{$dep}->{'rel'} = $rel;
+            $result{$dep}->{'version'} = $relv;
+        }
+    }
+    return 1 if $verify;
+    return \%result;
+}
+
+sub build_deplist {
+	my $list = shift;
+	my($key, $result);
+	
+	foreach $key (keys %$list) {
+		$result .= ", " if $result;
+		$result .= $key;
+		$result .= " ($list->{$key}->{'rel'} $list->{$key}->{'version'})"
+			if $list->{$key}->{'rel'} && $list->{$key}->{'version'};
+	}
+	return $result;
+}
+
+sub merge_deps {
+    return $_[0] ? ($_[1] ? "$_[0], $_[1]" : $_[0]) : $_[1];
+}
+
+sub explain_dose_dependency {
+    my $dep = shift;
+    my $pkg = uri_unescape($dep->{'package'});
+    # This is needed when using the jessie-backports version of
+    # dose-builddebcheck. We should probably drop that when Stretch
+    # is released.
+    if (exists $dep->{'type'}) {
+        $pkg = $dep->{'type'} . ":" . $pkg;
+    }
+    my ($desc, $target);
+    if (exists $dep->{'unsat-dependency'}) {
+        $desc = 'depends on missing';
+        $target = $dep->{'unsat-dependency'};
+    } elsif (exists $dep->{'unsat-conflict'}) {
+        $desc = 'conflicts with';
+        $target = $dep->{'unsat-conflict'};
+        if ($target =~ /^src:/) {
+            # better expressed the other way round
+            ($pkg, $target) = ($target, $pkg);
+        }
+    } else {
+        $desc = 'depends on';
+        $target = $dep->{'depends'};
+    }
+    if ($pkg =~ s/^src:(?:(?:source|depwait)---)?//) {
+        return "$pkg build-$desc:\n- $target\n";
+    } else {
+        return "$pkg $desc:\n- $target\n";
+    }
+}
+
+sub explain_dose {
+    my $broken = shift;
+    my $explanation = '';
+    for my $reason (@{$broken->{'reasons'}}) {
+        if (exists $reason->{'missing'}) {
+            my $missing = $reason->{'missing'};
+            for my $depchain (@{$missing->{'depchains'}}) {
+                for my $dep (@{$depchain->{'depchain'}}) {
+                    $explanation .= explain_dose_dependency($dep);
+                }
+            }
+            $explanation .= explain_dose_dependency($missing->{'pkg'});
+        } elsif (exists $reason->{'conflict'}) {
+            my $conflict = $reason->{'conflict'};
+            for my $depchain (@{$conflict->{'depchain1'}}) {
+                for my $dep (@{$depchain->{'depchain'}}) {
+                    $explanation .= explain_dose_dependency($dep);
+                }
+            }
+            for my $depchain (@{$conflict->{'depchain2'}}) {
+                for my $dep (@{$depchain->{'depchain'}}) {
+                    $explanation .= explain_dose_dependency($dep);
+                }
+            }
+            $explanation .= explain_dose_dependency($conflict->{'pkg1'});
+        }
+    }
+    return $explanation;
+}
+
+sub wb_dose_builddebcheck {
+# Copyright (C) 2008 Ralf Treinen <treinen@debian.org>
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, version 2 of the License.
+# integrated into wanna-builds code by Andreas Barth 2010
+
+    my $args = shift;
+    my $architecture=$args->{arch};
+    my @doseoptions = qw(--failures --explain --quiet);
+    my $packagefiles = $args->{pkgs};
+    my $sourcesfile = $args->{src};
+    my $builddepalt = $args->{bda};
+
+    my $packagearch="";
+    foreach my $packagefile (@$packagefiles) {
+        open(my $fh,'<', $packagefile);
+        while (<$fh>) {
+            next unless /^Architecture/;
+            next if /^Architecture:\s*all/;
+            /Architecture:\s*([^\s]*)/;
+            if ($packagearch eq "") {
+    	        $packagearch = $1;
+            } elsif ( $packagearch ne $1) {
+    	        return "Package file contains different architectures: $packagearch, $1";
+            }
+        }
+        close $fh;
+    }
+
+    if ( $architecture eq "" ) {
+        if ( $packagearch eq "" ) {
+    	return "No architecture option given, " .
+    	    "and no non-all architecture found in the Packages file";
+        } else {
+	    $architecture = $packagearch;
+        }
+    } else {
+        if ( $packagearch ne "" && $architecture ne $packagearch) {
+	    return "Architecture option is $architecture ".
+	    "but the package file contains architecture $packagearch";
+        }
+    }
+
+    push @doseoptions, "--deb-emulate-sbuild" unless defined $builddepalt;
+    push @doseoptions, "--deb-native-arch=$architecture";
+    push @doseoptions, "--deb-cputable=$conf::dpkg_datadir/cputable" if defined $conf::dpkg_datadir;
+    push @doseoptions, "--deb-tupletable=$conf::dpkg_datadir/tupletable" if defined $conf::dpkg_datadir;
+    push @doseoptions, (@$packagefiles, $sourcesfile);
+
+    print "calling: dose-builddebcheck @doseoptions\n";
+    my ($in,$out,$err) = ('','','');
+    run ['dose-builddebcheck', @doseoptions], \$in, \$out, \$err;
+
+    # I now interpret the exit code. dose-builddebcheck manpage:
+    #
+    # Exit codes 0-63 indicate a normal termination of the program, codes 64-127
+    # indicate abnormal termination of the program (such as parse errors, I/O
+    # errors).
+
+    # I'm not handling exit codes <0 correctly here. Those will show up as large
+    # values instead, so they'll look like errors. Good enough
+    my $exitcode = $? >> 8;
+    if($exitcode < 0 || $exitcode > 63)
+    {
+        die "dose-builddebcheck failed! STDOUT:\n$out\n\nSTDERR:\n$err";
+    }
+
+    my $result={};
+    my $result_yaml = YAML::XS::Load($out);
+    for my $broken (@{$result_yaml->{'report'}}) {
+        if (exists $broken->{'package'}) {
+            my $src = uri_unescape($broken->{'package'});
+            # This is needed when using the jessie-backports version of
+            # dose-builddebcheck. We should probably drop that when Stretch
+            # is released.
+            if (exists $broken->{'type'}) {
+                $src = $broken->{'type'} . ":" . $src;
+            }
+            if ($src !~ s/^src://) {
+                #print "ignoring $broken->{'package'}\n";
+                next;
+            }
+            # At this point we could just dump out the reasons YAML
+            # directly.  However, that would cause the buildd.debian.org web
+            # interface to be unable to aggregate reasons for different
+            # architectures that differ only by the architecture of packages
+            # along dependency chains, so we go to some effort to format the
+            # reasons here in a way that doesn't suffer from that too badly.
+            $result->{$src} = explain_dose($broken);
+        } else {
+            #print "ignoring report entry without package name:\n";
+            #print "%$broken\n";
+            1;
+        }
+    }
+
+    return $result;
+}
+
+
+sub call_dose_builddebcheck {
+    my $args = shift;
+    my $srcs = $args->{'srcs'};
+    my $key;
+   
+    # Do not dispatch dose-builddebcheck if BD-Uninstallable is deactivated for the target.
+    # ("noadw")  Depwait will always be 1 in normal use.
+    return if defined ($distributions{$distribution}{noadw}) && not defined $args->{'depwait'};
+
+    # We need to check all of needs-build, as any new upload could make
+    # something in needs-build have uninstallable deps
+    # We also check everything in bd-uninstallable, as any new upload could
+    # make that work again
+    my (%interesting_packages, %interesting_packages_depwait);
+    my $db = get_all_source_info(); # TODO: Filter for needs-build bd-uninst dep-wait, that's all we need.
+    foreach $key (keys %$db) {
+	my $pkg = $db->{$key};
+        if (defined $pkg and isin($pkg->{'state'}, qw/Needs-Build BD-Uninstallable/) and not defined ($distributions{$distribution}{noadw})) {
+		$interesting_packages{$key} = undef; # add key to interesting packages
+	}
+        if (defined $pkg and isin($pkg->{'state'}, qw/Dep-Wait/) and defined $args->{'depwait'}) {
+                # Depwaits are checked by creating pseudo sources for dose-builddebcheck, so collect them.
+		$interesting_packages_depwait{$key} = undef;
+                # we always check for BD-Uninstallability in depwait - could be that depwait is satisfied but package is uninstallable
+		$interesting_packages{$key} = undef unless defined ($distributions{$distribution}{noadw});
+	}
+    }
+    
+    #print "I would look at these sources with dose-builddebcheck:\n";
+    #print join " ", keys %interesting_packages,"\n";
+    return unless %interesting_packages || %interesting_packages_depwait;
+
+    my $tmpfile_pattern = "/tmp/wanna-build-interesting-sources-$distribution.$$-XXXXX";
+    use File::Temp qw/ tempfile /;
+    my ($SOURCES, $tmpfile) = tempfile( $tmpfile_pattern, UNLINK => 1 );
+    for my $key (keys %interesting_packages) {
+	my $pkg = $db->{$key};
+	# Prefix "source---" to make sure these are distinct from depwaits;
+	# the same source package may be present in both.
+	print $SOURCES "Package: source---$key\n";
+	print $SOURCES "Version: $pkg->{'version'}\n";
+	my $t = $srcs->{$key}{'dep'} || $srcs->{$key}{'depends'};
+	if ($args->{'arch'} eq 'all') {
+	    $t = &merge_deps($t, $srcs->{$key}{'dep-indep'} || $srcs->{$key}{'depends-indep'});
+	} else {
+	    $t = &merge_deps($t, $srcs->{$key}{'dep-arch'} || $srcs->{$key}{'depends-arch'});
+	}
+	$t = &merge_deps($t, $pkg->{'extra_depends'});
+	print $SOURCES "Build-Depends: $t\n" if $t;
+
+	my $u = $srcs->{$key}{'conf'} || $srcs->{$key}{'conflicts'};
+	if ($args->{'arch'} eq 'all') {
+	    $u = &merge_deps($u, $srcs->{$key}{'conf-indep'} || $srcs->{$key}{'conf-indep'});
+	} else {
+	    $u = &merge_deps($u, $srcs->{$key}{'conf-arch'} || $srcs->{$key}{'conf-arch'});
+	}
+	$u = &merge_deps($u, $pkg->{'extra_conflicts'});
+	print $SOURCES "Build-Conflicts: $u\n" if $u;
+	print $SOURCES "Architecture: all\n";
+	print $SOURCES "\n";
+    }
+    for my $key (keys %interesting_packages_depwait) {
+	my $pkg = $db->{$key};
+	# Prefix "depwait---" to make sure these are distinct from
+	# non-depwait checks; the same source package may be present in
+	# both.
+	print $SOURCES "Package: depwait---$key\n";
+	print $SOURCES "Version: $pkg->{'version'}\n";
+	print $SOURCES "Build-Depends: $pkg->{'depends'}\n";
+	print $SOURCES "Architecture: all\n";
+	print $SOURCES "\n";
+    }
+    close $SOURCES;
+
+    return if $simulate_dose;
+
+    # We build arch:all packages on a specific architecture
+    my $hostarch = $args->{arch};
+    $hostarch = $conf::all_buildd_arch if ($hostarch eq 'all' && $conf::all_buildd_arch);
+    my $doseresults = wb_dose_builddebcheck({arch => $hostarch,
+                                             pkgs => $args->{pkgs},
+                                             src  => $tmpfile,
+                                             bda  => $distributions{$distribution}{build_dep_alternatives}});
+    if (ref($doseresults) eq 'HASH') {
+        foreach my $key (grep { $_ =~ /^source---/ } keys %$doseresults) {
+		$key =~ s/^source---//;
+		if (exists $interesting_packages{$key}) {
+		    $interesting_packages{$key} = $doseresults->{"source---".$key};
+		} else {
+		    #print "TODO: dose reported a package we do not care about now\n" if $verbose;
+		}
+        }
+        foreach my $key (grep { $_ =~ /^depwait---/ } keys %$doseresults) {
+		$key =~ s/^depwait---//;
+		if (exists $interesting_packages_depwait{$key}) {
+		    $interesting_packages_depwait{$key} = $doseresults->{"depwait---".$key};
+		} else {
+		    #print "TODO: dose reported a package we do not care about now\n" if $verbose;
+		}
+        }
+    } else {
+        # if $doseresults isn't an hash, then something went wrong and the string is the error message
+        print "ERROR: Could not run wb-dose-builddebcheck. I am continuing, assuming\n" .
+             "all packages have installable build-dependencies."
+    }
+    
+    unlink( $tmpfile );
+
+    for my $key (keys %interesting_packages) {
+        next if defined $interesting_packages_depwait{$key};
+	my $pkg = $db->{$key};
+        # (defined $interesting_packages{$key}) => dose found an uninstallability
+	my $change = 
+	    (defined $interesting_packages{$key} and $pkg->{'state'} eq 'Needs-Build') ||
+	    (not defined $interesting_packages{$key} and $pkg->{'state'} eq 'BD-Uninstallable');
+	my $problemchange = ($interesting_packages{$key}//"") ne ($pkg->{'bd_problem'}//"");
+	if ($change) {
+	    if (defined $interesting_packages{$key}) {
+		    change_state( \$pkg, 'BD-Uninstallable' );
+		    $pkg->{'bd_problem'} = $interesting_packages{$key};
+	    } else {
+		    change_state( \$pkg, 'Needs-Build' );
+	    }
+	}
+	if ($problemchange) {
+	    if (defined $interesting_packages{$key}) {
+		    $pkg->{'bd_problem'} = $interesting_packages{$key};
+	    }	
+	}
+	if ($change) {
+	    log_ta({'pkg' => $pkg, 'action' => "--merge-all (dose)", 'arch' => $arch, 'dist' => $distribution }) unless $simulate;
+	    print "dose-builddebcheck changed state of ${key}_$pkg->{'version'} ($args->{'arch'}) to $pkg->{'state'}\n" if $verbose || $simulate;
+	}
+	if ($change || $problemchange) {
+	    update_source_info({'pkg' => $pkg, 'arch' => $arch, 'dist' => $distribution});
+	}
+    }
+
+    for my $key (keys %interesting_packages_depwait) {
+        if ($interesting_packages_depwait{$key}) {
+            print "dep-wait for $key ($args->{'arch'}) not fullfiled yet\n" if $verbose || $simulate;
+            next;
+        }
+	my $pkg = $db->{$key};
+        # The depwait could be cleared with the result still being uninstallable.
+        if (defined $interesting_packages{$key}) {
+    	    change_state( \$pkg, 'BD-Uninstallable' );
+    	    $pkg->{'bd_problem'} = $interesting_packages{$key};
+        } else {
+    	    change_state( \$pkg, 'Needs-Build' );
+        }
+	update_source_info({'pkg' => $pkg, 'action' => "dose_builddebcheck: depwait" , 'arch' => $arch, 'dist' => $distribution}) unless $simulate;
+	print "dose-builddebcheck changed state of ${key}_$pkg->{'version'} ($args->{'arch'}) from dep-wait to $pkg->{'state'}\n" if $verbose || $simulate;
+    }
+}
+
+sub usage {
+	my $prgname;
+	($prgname = $0) =~ s,^.*/,,;
+	print <<"EOF";
+Usage: $prgname <options...> <package_version...>
+Options:
+    -v, --verbose: Verbose execution.
+    --simulate: Do not actually execute the action.
+        (Not yet implemented for all operations.  Check the source.)
+    -A arch: Architecture this operation is for.  (REQUIRED)
+    -d dist: Distribution/suite this operation is for. Defaults to unstable.
+    --take: Take package for building [default operation]
+    -f, --failed: Record in database that a build failed due to
+        deficiencies in the package (that aren't fixable without a new
+        source version).
+    -u, --uploaded: Record in the database that the packages build
+        correctly and were uploaded.
+    -n, --no-build: Record in the database that the packages aren't
+        desired for this architecture and shouldn't appear in listings even
+	if they're out of date.
+    --dep-wait: Record in the database that the packages are waiting
+        for some source dependencies to become available
+    --binNMU num: Schedule a re-build of the package with unchanged source, but
+         a new version number (source-version + "+b<num>")
+    --give-back: Mark a package as ready to build that is in state Building,
+	 Built or Build-Attempted. To give back a package in state Failed, use
+	 --override. This command will actually put the package in state
+	 BD-Uninstallable, until the installability of its Build-Dependencies
+	 were verified. This happens at each call of --merge-all, usually
+	 every 15 minutes.
+    --build-priority=VALUE: Adjust the build priority of the currently
+        queued build.
+    --permanent-build-priority=VALUE: Adjust the permanent build
+        priority of a source package in a given distribution.
+    --extra-depends=BUILD-DEPENDS: Specify additional build-dependencies
+        used for the build.
+    --extra-conflicts=BUILD-DEPENDS: Specify additional build-conflicts
+        used for the build.
+    -i SRC_PKG, --info SRC_PKG: Show information for source package
+    -l STATE, --list=STATE: List all packages in state STATE; can be
+        combined with -U to restrict to a specific user; STATE can
+        also be 'all'
+    --min-age=VALUE, --max-age=VALUE: Filter the output of --list
+        by the age of the builds.
+    -m MESSAGE, --message=MESSAGE: Give reason why package failed or
+        source dependency list
+        (used with -f, --dep-wait, and --binNMU)
+    -o, --override: Override another user's lock on a package, i.e.
+        take it over; a notice mail will be sent to the other user
+    -U USER, --user=USER: select user name for which listings should
+        apply, if not given all users are listed.
+        if -l is missing, set user name to be entered in db; usually
+        automatically choosen
+    --import FILE: Import database from a ASCII file FILE
+    --export FILE: Export database to a ASCII file FILE
+    --format string, --own-format name: specify how the listing of packages
+        should look like. Please check the source for details. Own-Format
+        definitions are in ~/.wanna-build.yaml within the format section.
+
+There are more options not relevant for normal usage - please check source
+if you need them.
+
+The remaining arguments (depending on operation) usually start with
+"name_version", the trailer is ignored. This allows to pass the names
+of .dsc files, for which file name completion can be used.
+EOF
+	exit 1;
+}
+
+sub pkg_version_eq {
+	my $pkg = shift;
+	my $version = shift;
+
+	return 1
+	       if (defined $pkg->{'binary_nmu_version'}) and 
+	       version_compare(binNMU_version($pkg->{'version'},
+			$pkg->{'binary_nmu_version'}),'=', $version);
+	return version_compare( $pkg->{'version'}, "=", $version );
+}
+
+sub table_name {
+	return '"' . $_[1]. $schema_suffix . '".'.$_[0];
+}
+
+sub get_readonly_source_info {
+	my $s = shift;
+	# SELECT FLOOR(EXTRACT('epoch' FROM age(localtimestamp, '2010-01-22  23:45')) / 86400) -- change to that?
+        my $q = "SELECT rel, priority, state_change, permbuildpri, section, buildpri, failed, state, binary_nmu_changelog, bd_problem, version, package, distribution, installed_version, notes, builder, old_failed, previous_state, binary_nmu_version, depends, extract(days from date_trunc('days', now() - state_change)) as state_days, floor(extract(epoch from now()) - extract(epoch from state_change)) as state_time"
+            . ", (SELECT max(build_time) FROM ".table_name('pkg_history', $s->{'arch'})." WHERE pkg_history.package = packages.package AND pkg_history.distribution = packages.distribution AND result = 'successful') AS successtime"
+            . ", (SELECT max(build_time) FROM ".table_name('pkg_history', $s->{'arch'})." WHERE pkg_history.package = packages.package AND pkg_history.distribution = packages.distribution ) AS anytime"
+            . ", extra_depends, extra_conflicts"
+            . " FROM " .  table_name('packages', $s->{'arch'})
+            . ' WHERE package = ? AND distribution = ?';
+	my $pkg = $dbh->selectrow_hashref( $q,
+		undef, $s->{'name'}, $s->{'dist'});
+	return $pkg;
+}
+
+sub get_source_info {
+	my $s = shift;
+        return get_readonly_source_info($s) if $simulate;
+	lock_table();
+	my $pkg = $dbh->selectrow_hashref('SELECT *, extract(days from date_trunc(\'days\', now() - state_change)) as state_days, floor(extract(epoch from now()) - extract(epoch from state_change)) as state_time FROM ' . 
+		table_name('packages', $s->{'arch'}) . ' WHERE package = ? AND distribution = ?',
+		undef, $s->{'name'}, $s->{'dist'});
+	return $pkg;
+}
+
+sub get_all_source_info {
+	my %options = @_;
+
+        my $q = "SELECT rel, priority, state_change, permbuildpri, section, buildpri, failed, state, binary_nmu_changelog, bd_problem, version, package, distribution, installed_version, notes, builder, old_failed, previous_state, binary_nmu_version, depends, extract(days from date_trunc('days', now() - state_change)) as state_days, floor(extract(epoch from now()) - extract(epoch from state_change)) as state_time"
+#            . ", (SELECT max(build_time) FROM ".table_name('pkg_history', $arch)." WHERE pkg_history.package = packages.package AND pkg_history.distribution = packages.distribution AND result = 'successful') AS successtime"
+#            . ", (SELECT max(build_time) FROM ".table_name('pkg_history', $arch)." WHERE pkg_history.package = packages.package AND pkg_history.distribution = packages.distribution ) AS anytime"
+            . ", successtime.build_time as successtime, anytime.build_time as anytime, extra_depends, extra_conflicts"
+            . " FROM " .  table_name('packages', $arch)
+                . " left join ( "
+                  . "select distinct on (package, distribution) build_time, package, distribution from ".table_name('pkg_history', $arch)." where result = 'successful' order by package, distribution, timestamp "
+                  . " ) as successtime using (package, distribution) "
+                . " left join ( "
+                  . "select distinct on (package, distribution) build_time, package, distribution from ".table_name('pkg_history', $arch)." order by package, distribution, timestamp desc"
+                  . " ) as anytime using (package, distribution) "
+	    . " WHERE TRUE ";
+        my @args = ();
+        if ($distribution) {
+            my @dists = split(/[, ]+/, $distribution);
+            $q .= ' AND ( distribution = ? '.(' OR distribution = ? ' x $#dists).' )';
+            foreach my $d ( @dists ) {
+                push @args, ($d);
+            }
+        }
+	if ($options{state} && uc($options{state}) ne "ALL") {
+		$q .= ' AND upper(state) = ? ';
+		push @args, uc($options{state});
+	}
+
+	if ($options{user} && uc($options{state}) ne "NEEDS-BUILD") { # if it's NEEDS-BUILD, we don't look at users
+		#this basically means "this user, or no user at all":
+		$q .= " AND (builder = ? OR upper(state) = 'NEEDS-BUILD')";
+		push @args, $options{user};
+	}
+
+	if ($options{list_min_age}) {
+                $q .= ' AND age(now(),state_change) > ?';
+		push @args, $options{list_min_age} . " days";
+	}
+
+	if ($options{list_max_age}) {
+                $q .= ' AND age(now(),state_change) < ?';
+		push @args, $options{list_max_age} . " days";
+	}
+
+	my $db;
+        if (($options{multisuite}) && (!$distribution || $distribution =~ / /)) {
+            # return packages in multiple suites - only for those functions marked as clean for that api change
+            $db = $dbh->selectall_hashref($q, [qw<package distribution>], undef, @args);
+            my $dbk = {};
+            foreach my $p ( keys %$db ) {
+                foreach my $d (keys %{$db->{$p}}) {
+                    $dbk->{"$p/$d"} = $db->{$p}->{$d};
+                }
+            }
+            $db = $dbk;
+        } else {
+            $db = $dbh->selectall_hashref($q, [qw<package>], undef, @args);
+        }
+	return $db;
+}
+
+sub show_distribution_architectures {
+    my $args = shift;
+    if (defined($args->{suite})) {
+        foreach my $architecture (sort keys %{$distribution_architectures{$args->{suite}}}) {
+            print $architecture." ";
+        }
+        print "\n";
+    } else {
+        foreach my $distribution (sort keys %distribution_architectures) {
+            print $distribution.':';
+            foreach my $architecture (sort keys %{$distribution_architectures{$distribution}}) {
+                print " ".$architecture;
+            }
+            print "\n";
+        }
+    }
+}
+
+sub show_distribution_aliases {
+	foreach my $alias (sort keys %distribution_aliases) {
+		print $alias.': '.$distribution_aliases{$alias}."\n";
+	}
+}
+
+sub update_source_info {
+        my $s = shift;
+        my $pkg = $s->{'pkg'};
+        my $dist = $s->{'dist'} || $distribution;
+	my $arch = $s->{'arch'};
+
+	log_ta($s) if $s->{'action'};
+        $pkg->{'extra_depends'} = $extra_depends if defined $extra_depends;
+        undef $pkg->{'extra_depends'} unless $pkg->{'extra_depends'};
+        $pkg->{'extra_conflicts'} = $extra_conflicts if defined $extra_conflicts;
+        undef $pkg->{'extra_conflicts'} unless $pkg->{'extra_conflicts'};
+        print Dumper $pkg if $verbose and $simulate;
+        return if $simulate;
+
+	my $pkg2 = get_source_info({'name' => $pkg->{'package'}, 'arch' => $s->{'arch'}, 'dist' => $s->{'dist'}});
+	if (! defined $pkg2)
+	{
+		$dbh->do('INSERT INTO ' . table_name('packages', $s->{arch}) .
+			' (package, distribution) values (?, ?)',
+			undef, $pkg->{'package'}, $s->{'dist'}) or die $dbh->errstr;
+	}
+
+	$dbh->do('UPDATE ' . table_name('packages', $s->{arch}) . ' SET ' .
+			'version = ?, ' .
+			'state = ?, ' .
+			'section = ?, ' .
+			'priority = ?, ' .
+			'installed_version = ?, ' .
+			'previous_state = ?, ' .
+			(($pkg->{'do_state_change'}) ? "state_change = now()," : "").
+			'notes = ?, ' .
+			'builder = ?, ' .
+			'failed = ?, ' .
+			'old_failed = ?, ' .
+			'binary_nmu_version = ?, ' .
+			'binary_nmu_changelog = ?, ' .
+			'permbuildpri = ?, ' .
+			'buildpri = ?, ' .
+			'depends = ?, ' .
+			'rel = ?, ' .
+			'extra_depends = ?, ' .
+			'extra_conflicts = ?, ' .
+			'bd_problem = ? ' .
+			'WHERE package = ? AND distribution = ?',
+		undef,
+		$pkg->{'version'},
+		$pkg->{'state'},
+		$pkg->{'section'},
+		$pkg->{'priority'},
+		$pkg->{'installed_version'},
+		$pkg->{'previous_state'},
+		$pkg->{'notes'},
+		$pkg->{'builder'},
+		$pkg->{'failed'},
+		$pkg->{'old_failed'},
+		$pkg->{'binary_nmu_version'},
+		$pkg->{'binary_nmu_changelog'},
+		$pkg->{'permbuildpri'},
+		$pkg->{'buildpri'},
+		$pkg->{'depends'},
+		$pkg->{'rel'},
+                $pkg->{'extra_depends'},
+                $pkg->{'extra_conflicts'},
+		$pkg->{'bd_problem'},
+		$pkg->{'package'},
+		$s->{'dist'}) or die $dbh->errstr;
+}
+
+sub del_source_info {
+        my $s = shift;
+	log_ta($s) if $s->{'action'};
+        return if $simulate;
+	$dbh->do('DELETE FROM ' . table_name('packages', $s->{'arch'}) .
+			' WHERE package = ? AND distribution = ?',
+		undef, $s->{'pkg'}->{'package'}, $s->{'dist'}) or die $dbh->errstr;
+}
+
+sub get_user_info {
+	my %options = @_;
+	my $name = $options{'name'};
+	my $dist = $options{'dist'} || $distribution;
+
+	my $user = $dbh->selectrow_hashref('SELECT * FROM ' . 
+		table_name('users', $arch) . ' WHERE username = ? AND distribution = ?',
+		undef, $name, $dist);
+	return $user;
+}
+
+sub update_user_info {
+	my %options = @_;
+	my $user = $options{'user'};
+	my $dist = $options{'dist'} || $distribution;
+
+	$dbh->do('UPDATE ' . table_name('users', $arch) .
+			' SET last_seen = now() WHERE username = ?' .
+			' AND distribution = ?',
+		undef, $user, $dist)
+		or die $dbh->errstr;
+}
+
+
+sub add_user_info {
+	my %options = @_;
+	my $user = $options{'user'};
+	my $dist = $options{'dist'} || $distribution;
+
+	$dbh->do('INSERT INTO ' . table_name('users', $arch) .
+			' (username, distribution, last_seen)' .
+			' values (?, ?, now())',
+		undef, $user, $dist)
+		or die $dbh->errstr;
+}
+
+sub lock_table {
+        return if $simulate;
+	$q = 'SELECT 1 AS result FROM public.locks' .
+	     ' WHERE architecture = ? AND distribution = ? FOR UPDATE';
+	my $result = $dbh->selectrow_hashref($q, undef, $arch, $distribution) or die $dbh->errstr;
+	die unless $result->{'result'} == 1;
+}
+
+sub parse_argv {
+# parts the array $_[0] and $_[1] and returns the sub-array (modifies the original one)
+    my @ret = ();
+    my $args = shift;
+    my $separator = shift;
+    while($args->[0] && $args->[0] ne $separator) { 
+        push @ret, shift @$args;
+    }
+    shift @$args if @$args;
+    return @ret;
+}
+
+sub parse_all_v3 {
+    my $srcs = shift;
+    my $vars = shift;
+    my $db = get_all_source_info();
+    my $binary = $srcs->{'_binary'};
+
+    SRCS:
+    foreach my $name (keys %$srcs) {
+        next if $name eq '_binary';
+
+        # state = installed, out-of-date, uncompiled, packages-arch-specific, overwritten-by-arch-all, arch-not-in-arch-list, arch-all-only
+        my $pkgs = $srcs->{$name};
+        next if isin($pkgs->{'status'}, qw <arch-all-only>);
+        my $pkg = $db->{$name};
+
+        unless ($pkg) {
+            next SRCS if $pkgs->{'status'} eq 'packages-arch-specific';
+            my $logstr = sprintf("merge-v3 %s %s_%s (%s, %s):", $vars->{'time'}, $name, $pkgs->{'version'}, $vars->{'arch'}, $vars->{'suite'});
+
+            # does at least one binary exist in the database and is more recent - if so, we're probably just outdated, ignore the source package
+            for my $bin (@{$pkgs->{'binary'}}) {
+                if ($binary->{$bin} and $binary->{$bin}->{'arch'} ne 'all' and vercmp($pkgs->{'version'}, $binary->{$bin}->{'version'}) < 0) {
+                    print "$logstr skipped because binaries (assumed to be) overwritten (" .
+			$bin . ", " . $pkgs->{'version'} . " vs. " . $binary->{$bin}->{'version'} . ")\n" if $verbose || $simulate;
+                    next SRCS;
+                }
+            }
+            $pkg->{'package'}  = $name;
+        }
+        $pkg->{'version'} ||= "";
+        $pkg->{'state'} ||= "";
+        my $logstr = sprintf("merge-v3 %s %s_%s", $vars->{'time'}, $name, $pkgs->{'version'}).
+            ($pkgs->{'binnmu'} ? ";b".$pkgs->{'binnmu'} : "").
+            sprintf(" (%s, %s, previous: %s", $vars->{'arch'}, $vars->{'suite'}, $pkg->{'version'}//"").
+            ($pkg->{'binary_nmu_version'} ? ";b".$pkg->{'binary_nmu_version'} : "").
+            ", $pkg->{'state'}".($pkg->{'notes'} ? "/".$pkg->{'notes'} : "")."):";
+
+        if (isin($pkgs->{'status'}, qw (installed related)) && $pkgs->{'version'} eq $pkg->{'version'} && ($pkgs->{'binnmu'}//0) < int($pkg->{'binary_nmu_version'}//0)) {
+                $pkgs->{'status'} = 'out-of-date';
+        }
+        if (isin($pkgs->{'status'}, qw <installed related arch-not-in-arch-list packages-arch-specific overwritten-by-arch-all arch-all-only>)) {
+            my $change = 0;
+            my $tstate = {'installed' => 'Installed', 'related' => 'Installed', 
+                'arch-not-in-arch-list' => 'Auto-Not-For-Us', 'packages-arch-specific' => 'Auto-Not-For-Us', 'overwritten-by-arch-all' => 'Auto-Not-For-Us', 'arch-all-only' => 'Auto-Not-For-Us',
+                }->{$pkgs->{'status'}};
+            next if isin( $pkg->{'state'}, qw<Not-For-Us>) && isin( $tstate, qw<Auto-Not-For-Us Installed>);
+            if ($pkg->{'state'} ne $tstate) {
+                change_state( \$pkg, $tstate);
+                if (isin( $tstate, qw<Installed>)) {
+                    delete $pkg->{'depends'};
+                    delete $pkg->{'extra_depends'};
+                    delete $pkg->{'extra_conflicts'};
+                }
+                $change++;
+            }
+            my $attrs = { 'version' => 'version', 'installed_version' => 'version', 'binary_nmu_version' => 'binnmu', 'section' => 'section', 'priority' => 'priority' };
+            foreach my $k (keys %$attrs) {
+                next if isin( $tstate, qw<Auto-Not-For-Us>) && isin( $k, qw<installed_version binary_nmu_version>);
+                if (($pkg->{$k}//"") ne ($pkgs->{$attrs->{$k}}//"")) {
+                    $pkg->{$k} = $pkgs->{$attrs->{$k}};
+                    $change++;
+                }
+            }
+            if (isin($pkgs->{'status'}, qw <related packages-arch-specific overwritten-by-arch-all arch-not-in-arch-list arch-all-only>)) {
+                my $tnotes = $pkgs->{'status'};
+                if (($pkg->{'notes'}//"") ne $tnotes) {
+                    $pkg->{'notes'} = $tnotes;
+                    $change++;
+                }
+            }
+            if ($change) {
+                print "$logstr set to $tstate/".($pkg->{'notes'}//"")."\n" if $verbose || $simulate;
+                update_source_info({'pkg' => $pkg, 'action' => "--merge-v3: $tstate" , 'arch' => $arch, 'dist' => $distribution});
+            }
+            next;
+        }
+
+	# update the notes with status unless this is one of the states where it isn't necessary
+        if (!(isin($pkg->{'state'}, qw <Installed Auto-Not-For-Us>)) && ($pkg->{'notes'}) && ($pkg->{'notes'} ne $pkgs->{'status'})) {
+                $pkg->{'notes'} = $pkgs->{'status'};
+                print "$logstr set to ".$pkg->{'state'}."/".($pkg->{'notes'}//"")."\n" if $verbose || $simulate;
+		update_source_info({'pkg' => $pkg, 'action' => "--merge-v3: /".$pkgs->{'status'}, 'arch' => $arch, 'dist' => $distribution});
+	}
+
+        # only uncompiled / out-of-date are left, so check if anything new
+        if (!(isin($pkgs->{'status'}, qw (uncompiled out-of-date)))) {
+            print "$logstr package in unknown state: $pkgs->{'status'}\n";
+            next SRCS;
+        }
+        next if $pkgs->{'version'} eq $pkg->{'version'} and $pkgs->{'binnmu'}//0 >= int($pkg->{'binary_nmu_version'}//0);
+        next if $pkgs->{'version'} eq $pkg->{'version'} and !isin( $pkg->{'state'}, qw(Installed));
+        next if isin( $pkg->{'state'}, qw(Not-For-Us Failed-Removed));
+
+        change_state( \$pkg, 'Needs-Build');
+        $pkg->{'notes'} = $pkgs->{'status'};
+        $pkg->{'version'} = $pkgs->{'version'};
+        $pkg->{'section'} = $pkgs->{'section'};
+        $pkg->{'priority'} = $pkgs->{'priority'};
+        $pkg->{'dep'} = $pkgs->{'depends'};
+        $pkg->{'dep-arch'} = $pkgs->{'depends-arch'};
+        $pkg->{'dep-indep'} = $pkgs->{'depends-indep'};
+        $pkg->{'conf'} = $pkgs->{'conflicts'};
+        $pkg->{'conf-arch'} = $pkgs->{'conflicts-arch'};
+        $pkg->{'conf-indep'} = $pkgs->{'conflicts-indep'};
+        delete $pkg->{'builder'};
+        delete $pkg->{'binary_nmu_version'} unless $pkgs->{'binnmu'};
+        delete $pkg->{'binary_nmu_changelog'} unless $pkgs->{'binnmu'};
+        delete $pkg->{'buildpri'};
+        update_source_info({'pkg' => $pkg, 'action' => "--merge-v3: needs-build" , 'arch' => $arch, 'dist' => $distribution});
+        print "$logstr set to needs-builds\n" if $simulate || $verbose;
+    }
+
+    foreach my $name (keys %$db) {
+        next if $srcs->{$name} and not isin($srcs->{$name}->{'status'}, qw <arch-all-only>);
+        my $pkg = $db->{$name};
+        my $logstr = "merge-v3 $vars->{'time'} ".$name."_$pkg->{'version'} ($vars->{'arch'}, $vars->{'suite'}, previous: $pkg->{'state'}):";
+        # package disappeared - delete
+        change_state( \$pkg, 'deleted' );
+        del_source_info({'pkg' => $pkg, 'action' => "--merge-v3: deleted" , 'arch' => $arch, 'dist' => $distribution});
+	print "$logstr deleted from database\n" if $verbose || $simulate;
+        delete $db->{$name};
+    }
+}

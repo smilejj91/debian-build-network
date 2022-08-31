@@ -1,0 +1,15 @@
+#!/bin/sh
+
+cd /srv/wanna-build/triggers
+./trigger.local
+PATH=/srv/wanna-build/bin:$PATH
+
+for arch in all amd64 arm64 i386
+do
+	cat <<EOF
+=========================
+ARCHITECTURE: $arch
+=========================
+EOF
+	wanna-build-statistics --dist=gorani --arch=$arch
+done

@@ -1,0 +1,26 @@
+Configuration
+=============
+1. Dockerfile
+1-1. `MAINTAINER` (line 2)
+
+2. init
+2-1. `distributions`, `distribution_architectures`, `locks`, and `distribution_aliases` in postgres db init (line 65-71)
+2-2. `suites`, `fqdn`, and `deb_fqdn` (line 75-77)
+
+3. trigger.local
+3-1. `ARCHIVE`, `SUITES`, and `REPOSITORY` (line 6-10)
+
+4. docker-wb.service
+4-1. docker arguments such as `--domainname` (line 7)
+
+5. ssh authorized_keys
+5-1. `authorized_keys` file in ssh_all, ssh_amd64, and ssh_i386 directories 
+
+Installation
+============
+1. Build the docker image with the given `Dockerfile`.
+2. Install the systemd service with the given `docker-wb.service`.
+
+Use
+===
+1. Start the systemd service.

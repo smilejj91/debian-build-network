@@ -1,0 +1,104 @@
+#!/bin/sh
+
+cleanup() {
+	echo cleanup: done
+}
+trap cleanup TERM
+
+su --login postgres <<EOF
+/usr/lib/postgresql/13/bin/postgres -D /etc/postgresql/13/main &
+sleep 1
+EOF
+
+cd /srv/wanna-build/schema
+./arches-tables.sh all amd64 arm64 i386 >arches-tables.sql
+
+su --login postgres <<EOF
+psql <<EOF2
+CREATE DATABASE wannadb;
+CREATE USER wbadm WITH PASSWORD 'wannapass';
+GRANT ALL PRIVILEGES ON DATABASE wannadb to wbadm;
+ALTER USER wbadm CREATEROLE;
+EOF2
+EOF
+
+su postgres <<EOF
+psql -d wannadb -f main-tables.sql
+psql -d wannadb -f roles.sql
+psql -d wannadb -f arches-tables.sql
+EOF
+
+mkdir /srv/wanna-build/tmp
+chmod 750 /srv/wanna-build/tmp
+chown wbadm. /srv/wanna-build/tmp
+
+cp /usr/share/postgresql/13/pg_service.conf.sample /etc/postgresql-common/pg_service.conf
+
+cat >>/etc/postgresql-common/pg_service.conf <<EOF
+[wanna-build]
+dbname=wannadb
+user=wbadm
+
+[wanna-build-privileged]
+dbname=wannadb
+user=wbadm
+EOF
+
+temp_file=$(mktemp)
+cat >>$temp_file <<EOF
+local   all             wbadm                                   trust
+EOF
+cat /etc/postgresql/13/main/pg_hba.conf >>$temp_file
+chown postgres. $temp_file
+mv $temp_file /etc/postgresql/13/main/pg_hba.conf
+
+# restart
+pkill postgres
+sleep 5
+su --login postgres <<EOF
+/usr/lib/postgresql/13/bin/postgres -D /etc/postgresql/13/main &
+sleep 1
+EOF
+
+su --login wbadm <<EOF
+psql wannadb <<EOF2
+INSERT INTO distributions(distribution,build_dep_resolver) VALUES ('gorani','apt');
+INSERT INTO architectures(architecture) VALUES ('all'),('amd64'),('arm64'),('i386');
+INSERT INTO distribution_architectures(distribution,architecture,archive) VALUES ('gorani','all','tmax'),('gorani','amd64','tmax'),('gorani','arm64','tmax'),('gorani','i386','tmax');
+
+INSERT INTO locks(distribution,architecture) VALUES ('gorani','all'),('gorani','amd64'),('gorani','arm64'),('gorani','i386');
+
+INSERT INTO distribution_aliases(distribution,alias) VALUES ('gorani','tmax-unstable');
+EOF2
+EOF
+
+suites="gorani"
+fqdn="buildd.ci.tmaxos.net"
+deb_fqdn="buildd.debian.org"
+
+mkdir /srv/$fqdn
+chown wbadm. /srv/$fqdn/
+su --login wbadm <<EOF
+for suite in $suites
+do
+	specific_dir=/srv/$fqdn/web/quinn-diff/\$suite
+	mkdir -p \$specific_dir
+	wget https://$deb_fqdn/quinn-diff/sid/Packages-arch-specific \
+		 -O \$specific_dir/Packages-arch-specific
+	# sed
+done
+EOF
+
+# tinysshd
+sh <<EOF >>/var/log/tinysshd.log 2>&1 &
+#!/bin/sh
+/usr/sbin/tinysshd-makekey -q /etc/tinyssh/sshkeydir
+while true
+do
+	tcpsvd -l buildd -vv 0 22 tinysshd /etc/tinyssh/sshkeydir
+done
+EOF
+
+# cron
+su --login wbadm -c "sh /etc/work"
+cron -f

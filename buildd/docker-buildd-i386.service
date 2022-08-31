@@ -1,0 +1,12 @@
+[Unit]
+Description=Buildd for i386 as Docker instance
+After=network-online.target
+Requires=network-online.target
+
+[Service]
+ExecStart=docker run --rm -t --privileged --hostname buildd-i386 --mount type=bind,source=/srv/buildd/i386,target=/srv/buildd --domainname ci.tmaxos.net --name buildd-i386 harbor.tmaxos.net/infra/buildd-i386:1.0.0
+ExecStop=docker stop buildd-amd64
+
+[Install]
+WantedBy=multi-user.target
+Alias=buildd-i386.service

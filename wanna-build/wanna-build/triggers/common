@@ -1,0 +1,199 @@
+# vim:set et ts=4 sw=4 ft=bash ai:
+
+set -eE
+
+LANG=C
+PATH="/bin:/usr/bin:/srv/wanna-build/bin:/srv/buildd.debian.org/bin:/srv/wanna-build/triggers"
+ARCHIVE_MAIN="/srv/wanna-build/tmp/archive/debian"
+ARCHIVE_BASE="/srv/wanna-build/tmp/archive/${ARCHIVE}"
+PAS_BASE="/srv/buildd.debian.org/web/quinn-diff"
+LOCKFILE="${ARCHIVE_BASE}/lock"
+
+# Creates a working environment within the corresponding archive
+# directory and jumps there.
+ensure_workdir() {
+    mkdir -p "${ARCHIVE_BASE}/workdir"
+    cd "${ARCHIVE_BASE}/workdir"
+}
+
+# Puts the list of architectures for a given suite onto stdout.
+get_architectures() {
+    local SUITE="$1"
+    local ARCHS
+
+    ARCHS=$(wanna-build --archive="$ARCHIVE" --distribution-architectures | grep "$SUITE: " | cut -d':' -f 2)
+    if [ -z "$ARCHS" ]; then
+         echo "Unknown suite encountered, aborting." >&2
+         exit 1
+    fi
+    echo $ARCHS
+}
+
+# Get the compression format used in a given suite
+get_index_extension() {
+    local SUITE="$1"
+    echo ".xz"
+}
+
+get_pas_file() {
+    local SUITE="$1"
+    echo "$PAS_BASE/${SUITE%%-*}/Packages-arch-specific"
+}
+
+cleanup() {
+    rm -rf "$LOCKFILE"
+}
+
+ensure_lock() {
+    if lockfile -! -r 10 -l 6000 "$LOCKFILE"
+    then
+        echo "Cannot lock $LOCKFILE, aborting."
+        exit 1
+    fi
+}
+
+trigger_wb_update() {
+    local SUITE="$1"
+    local ARCHS="$2"
+    local SOURCES="$3"
+    local PACKAGES="$4"
+    local WB_SUITE="$5"
+
+    if [ -z "$WB_SUITE" ]
+    then
+        local WB_SUITE="${SUITE}"
+    fi
+
+    echo "`date`: Processing ${ARCHIVE}/${SUITE} ..."
+
+    keep-latest source $(eval echo ${SOURCES}) > Sources.${SUITE}
+    for ARCH in ${ARCHS}; do
+        keep-latest ${ARCH} $(eval echo $(echo ${PACKAGES} | sed -e 's/%ARCH%/${ARCH}/g')) > Packages.${SUITE}.${ARCH}
+        : > Packages.${SUITE}.${ARCH}.build-essential
+        for pkg in perl ; do
+            grep-dctrl -S -s Package,Version,Priority,Section,Architecture -X $pkg < Packages.${SUITE}.${ARCH} | sed -e '/^Version/ s,$,+build-essential,' >> Packages.${SUITE}.${ARCH}.build-essential
+        done
+        for pkg in make binutils dpkg-dev; do
+            grep-dctrl -S -s Package,Version,Priority,Section,Architecture -X $pkg < Packages.${SUITE}.${ARCH} | sed -e '/^Version/ s,$,+build-essential,' >> Packages.${SUITE}.${ARCH}.build-essential
+        done
+        grep-dctrl -F Priority required -s Package,Version,Priority,Section,Architecture < Packages.${SUITE}.${ARCH} | sed -e '/^Version/ s,$,+build-essential,' >> Packages.${SUITE}.${ARCH}.build-essential
+        grep-dctrl -F Essential -i yes -s Package,Version,Priority,Section,Architecture < Packages.${SUITE}.${ARCH} | sed -e '/^Version/ s,$,+build-essential,' >> Packages.${SUITE}.${ARCH}.build-essential
+        grep-dctrl -F Build-Essential -i yes -s Package,Version,Priority,Section,Architecture < Packages.${SUITE}.${ARCH} | sed -e '/^Version/ s,$,+build-essential,' >> Packages.${SUITE}.${ARCH}.build-essential
+    done
+    [ -f Packages.${SUITE}.i386.non-free ] && PNF="Packages.${SUITE}.%ARCH%.non-free" || PNF=""
+    [ -f Sources.${SUITE}.non-free ] && SNF="Sources.${SUITE}.non-free" || SNF=""
+    ARCHS_any=$(echo ${ARCHS} | sed -e 's/all//g')
+    echo parallel -l 6 -i wanna-build -v --Pas $(get_pas_file $SUITE) --merge-v3 -A "{}" --dist=$WB_SUITE Packages.${SUITE}.%ARCH% $PNF . Sources.${SUITE} $SNF . Packages.${SUITE}.%ARCH% Packages.${SUITE}.%ARCH%.build-essential -- ${ARCHS_any}
+    parallel -l 6 -i wanna-build -v --Pas $(get_pas_file $SUITE) --merge-v3 -A "{}" --dist=$WB_SUITE Packages.${SUITE}.%ARCH% $PNF . Sources.${SUITE} $SNF . Packages.${SUITE}.%ARCH% Packages.${SUITE}.%ARCH%.build-essential -- ${ARCHS_any} || true
+    if echo ${ARCHS} | grep -q 'all' ; then
+        echo wanna-build -v --Pas $(get_pas_file $SUITE) --merge-v3 -A all --dist=$WB_SUITE Packages.${SUITE}.all $PNF . Sources.${SUITE} $SNF . Packages.${SUITE}.amd64 Packages.${SUITE}.amd64.build-essential
+        wanna-build -v --Pas $(get_pas_file $SUITE) --merge-v3 -A all --dist=$WB_SUITE Packages.${SUITE}.all $PNF . Sources.${SUITE} $SNF . Packages.${SUITE}.amd64 Packages.${SUITE}.amd64.build-essential || true
+    fi
+
+    echo "`date`: ${ARCHIVE}/${SUITE} done"
+}
+
+trigger_wb_update_for_overlay() {
+    local SUITE="$1"
+    local ARCHS="$2"
+    local SOURCES_BASE="$3"
+    local PACKAGES_BASE="$4"
+    local SOURCES="$5"
+    local PACKAGES="$6"
+    local WB_SUITE="$7"
+
+    if [ -z "$WB_SUITE" ]
+    then
+        local WB_SUITE="${SUITE}"
+    fi
+
+    echo "`date`: Processing ${ARCHIVE}/${SUITE} ..."
+
+    keep-latest source $(eval echo ${SOURCES}) > Sources.${SUITE}
+    keep-latest source $(eval echo Sources.${SUITE} ${SOURCES_BASE}) > Sources.${SUITE}-all
+    for ARCH in ${ARCHS}; do
+        keep-latest ${ARCH} $(eval echo $(echo ${PACKAGES} | sed -e 's/%ARCH%/${ARCH}/g')) > Packages.${SUITE}.${ARCH}
+        keep-latest ${ARCH} Packages.${SUITE}.${ARCH} $(eval echo $(echo ${PACKAGES_BASE} | sed -e 's/%ARCH%/${ARCH}/g')) > Packages.${SUITE}.${ARCH}-all
+    done
+    [ -f Packages.${SUITE}.i386.non-free ] && PNF="Packages.${SUITE}.%ARCH%.non-free" || PNF=""
+    [ -f Sources.${SUITE}.non-free ] && SNF="Sources.${SUITE}.non-free" || SNF=""
+
+    ARCHS_any=$(echo ${ARCHS} | sed -e 's/all//g')
+    echo parallel -l 6 -i wanna-build -v --Pas $(get_pas_file $SUITE) --merge-v3 -A "{}" --dist=$WB_SUITE Packages.${SUITE}.%ARCH% $PNF . Sources.${SUITE} $SNF . \
+        Packages.${SUITE}.%ARCH%-all . Sources.${SUITE}-all $SNF -- ${ARCHS_any}
+    parallel -l 6 -i wanna-build -v --Pas $(get_pas_file $SUITE) --merge-v3 -A "{}" --dist=$WB_SUITE Packages.${SUITE}.%ARCH% $PNF . Sources.${SUITE} $SNF . \
+        Packages.${SUITE}.%ARCH%-all . Sources.${SUITE}-all $SNF -- ${ARCHS_any} || true
+    if echo ${ARCHS} | grep -q 'all' ; then
+        echo wanna-build -v --Pas $(get_pas_file $SUITE) --merge-v3 -A all --dist=$WB_SUITE Packages.${SUITE}.all $PNF . Sources.${SUITE} $SNF . \
+            Packages.${SUITE}.amd64-all . Sources.${SUITE}-all $SNF
+        wanna-build -v --Pas $(get_pas_file $SUITE) --merge-v3 -A all --dist=$WB_SUITE Packages.${SUITE}.all $PNF . Sources.${SUITE} $SNF . \
+            Packages.${SUITE}.amd64-all . Sources.${SUITE}-all $SNF || true
+    fi
+
+    echo "`date`: ${ARCHIVE}/${SUITE} done"
+}
+
+# This is for the case where you get also get packages from
+# a secondary unrelated suite, the buildd's chroot also has
+# those packages files in it.
+# Examples are *-{volatile,backports,edu} and experimental
+# This is not for something like stable and proposed-updates
+trigger_wb_update_with_secondary() {
+    local SUITE="$1"
+    local ARCHS="$2"
+    local PACKAGES_BASE="$3"
+    local SOURCES="$4"
+    local PACKAGES="$5"
+    local WB_SUITE="$6"
+
+    if [ -z "$WB_SUITE" ]
+    then
+        local WB_SUITE="${SUITE}"
+    fi
+
+    echo "`date`: Processing ${ARCHIVE}/${SUITE} ..."
+
+    keep-latest source $(eval echo ${SOURCES}) > Sources.${SUITE}
+
+    for ARCH in ${ARCHS}; do
+        keep-latest ${ARCH} $(eval echo $(echo ${PACKAGES} | sed -e 's/%ARCH%/${ARCH}/g')) > Packages.${SUITE}.${ARCH}
+        ucat Packages.${SUITE}.${ARCH} $(eval echo $(echo ${PACKAGES_BASE} | sed -e 's/%ARCH%/${ARCH}/g')) > Packages.${SUITE}.${ARCH}-all
+    done
+    [ -f Packages.${SUITE}.i386.non-free ] && PNF="Packages.${SUITE}.%ARCH%.non-free" || PNF=""
+    [ -f Sources.${SUITE}.non-free ] && SNF="Sources.${SUITE}.non-free" || SNF=""
+
+    ARCHS_any=$(echo ${ARCHS} | sed -e 's/all//g')
+    echo parallel -l 6 -i wanna-build -v --Pas $(get_pas_file $SUITE) --merge-v3 -A "{}" --dist=$WB_SUITE Packages.${SUITE}.%ARCH% $PNF . Sources.${SUITE} $SNF . \
+        Packages.${SUITE}.%ARCH%-all -- ${ARCHS_any}
+    parallel -l 6 -i wanna-build -v --Pas $(get_pas_file $SUITE) --merge-v3 -A "{}" --dist=$WB_SUITE Packages.${SUITE}.%ARCH% $PNF . Sources.${SUITE} $SNF . \
+        Packages.${SUITE}.%ARCH%-all -- ${ARCHS_any} || true
+    if echo ${ARCHS} | grep -q 'all' ; then
+        echo wanna-build -v --Pas $(get_pas_file $SUITE) --merge-v3 -A all --dist=$WB_SUITE Packages.${SUITE}.all $PNF . Sources.${SUITE} $SNF . \
+            Packages.${SUITE}.amd64-all
+         wanna-build -v --Pas $(get_pas_file $SUITE) --merge-v3 -A all --dist=$WB_SUITE Packages.${SUITE}.all $PNF . Sources.${SUITE} $SNF . \
+            Packages.${SUITE}.amd64-all
+    fi
+
+    echo "`date`: ${ARCHIVE}/${SUITE} done"
+}
+
+ucat() {
+    for FILE in $*; do
+      if [ -f ${FILE} ]; then
+        case $FILE in
+            *.gz)
+                zcat $FILE
+                ;;
+            *.bz2)
+                bzcat $FILE
+                ;;
+            *.xz)
+                xzcat $FILE
+                ;;
+            *)
+                cat $FILE
+                ;;
+        esac
+      fi
+    done
+}

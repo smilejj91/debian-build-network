@@ -1,0 +1,22 @@
+Configuration
+=============
+1. create buildd-xxx.conf
+- see `man buildd.conf` and `wiki.debian.org/BuilddSetup`
+
+2. generate buildd-xxx.gpg
+- Build public key for upload to upload queue server and DAK
+- See `wiki.debian.org/BuilddSetup` and execute `keygen` script
+
+
+Installation
+============
+1. Create configuration files: buildd-xxx.conf and buildd-xxx.gpg
+2. Build the docker image with `Dockerfile`.
+2.1 $ docker build . -f all.Dockerfile
+2.2 $ docker build . -f amd64.Dockerfile
+2.3 $ docker build . -f i386.Dockerfile
+3. Install the systemd service with `docker-buildd-xxx.service`
+
+Use
+===
+1. Start the systemd service.

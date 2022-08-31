@@ -1,0 +1,19 @@
+#!/bin/bash
+
+GPG_OPTS='--cert-digest-algo SHA256'
+gpg --batch --gen-key ${GPG_OPTS} --status-fd 3 3>keygen.log <<EOT
+%echo Generating key for ${host} ...
+%no-protection
+Key-Type: RSA
+Key-Usage: sign
+Key-Length: 4096
+Name-Real: buildd autosigning key ${host}
+Name-Email: buildd_${arch}-${host}@buildd.debian.org
+Expire-Date: 365d
+%commit
+EOT
+
+# usage
+# $ host=smilejj91 arch=amd64 ./keygen
+# $ gpg --export -a {gpg key id} > public-key.gpg
+# $ gpg --export-secret-key -a {gpg key id} > buildd-amd64.gpg 

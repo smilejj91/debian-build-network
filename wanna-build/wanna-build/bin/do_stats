@@ -1,0 +1,18 @@
+#!/bin/bash
+
+. /srv/wanna-build/triggers/common
+
+#
+# Only update stats if it's been at least 20h since the last time.
+#
+interval=72000
+last=`stat --format="%Y" /srv/wanna-build/etc/graph-data`
+now=`date +%s`
+if (( $last + $interval < $now )); then
+        echo "stats start: `date`"
+	/srv/wanna-build/bin/wb-graph >> /srv/wanna-build/etc/graph-data
+	/srv/wanna-build/bin/wb-graph -p >> /srv/wanna-build/etc/graph2-data
+	R --slave --vanilla < /srv/wanna-build/etc/graph.R
+        echo "stats ended: `date`"
+fi
+

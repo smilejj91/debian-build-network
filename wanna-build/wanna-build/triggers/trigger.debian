@@ -1,0 +1,111 @@
+#!/bin/bash
+# vim:set et ts=4 sw=4 ft=sh ai:
+
+ARCHIVE="debian"
+SUITES="buster bullseye bookworm"
+# Please note that SUITES_FAST_AUTOBUILD does not pull proposed-updates
+# because there was no need for that yet.
+SUITES_FAST_AUTOBUILD="sid experimental"
+
+. /srv/wanna-build/triggers/common
+
+exec >> /srv/wanna-build/logs/merge.$ARCHIVE.log 2>&1
+
+if [ -f /srv/wanna-build/NO-TRIGGERS -a -z "$1" ]
+then
+    echo Trigger for $ARCHIVE skipped due to NO-TRIGGERS, aborting. >&2
+    exit 0
+fi
+
+echo "`date`: Running trigger for $ARCHIVE ..."
+
+main_sync() {
+    ensure_lock
+    ensure_workdir
+
+    # Fetch the most recent Packages and Sources files.
+    sync.sh $ARCHIVE nolock
+
+    for SUITE in $SUITES
+    do
+        EXT="`get_index_extension ${SUITE}`"
+
+        # There's one sources file for -proposed-updates.  There are packages
+        # files for -proposed-updates itself and additionally for
+        # debian-installer.
+        SOURCES="${ARCHIVE_BASE}/archive/${SUITE}-proposed-updates/{main,contrib}/source/Sources${EXT}"
+        NFSOURCES="${ARCHIVE_BASE}/archive/${SUITE}-proposed-updates/non-free/source/Sources${EXT}"
+        PACKAGES="${ARCHIVE_BASE}/archive/${SUITE}-proposed-updates/{main,contrib}/binary-%ARCH%/Packages${EXT}"
+        PACKAGES="${PACKAGES} ${ARCHIVE_BASE}/archive/${SUITE}-proposed-updates/{main,contrib}/debian-installer/binary-%ARCH%/Packages${EXT}"
+        NFPACKAGES="${ARCHIVE_BASE}/archive/${SUITE}-proposed-updates/non-free/binary-%ARCH%/Packages${EXT}"
+        NFPACKAGES="${NFPACKAGES} ${ARCHIVE_BASE}/archive/${SUITE}-proposed-updates/non-free/debian-installer/binary-%ARCH%/Packages${EXT}"
+        /srv/wanna-build/bin/filter-nonfree /srv/wanna-build/etc/non-free-include-list "`get_architectures $SUITE`" Sources.${SUITE}.non-free Packages.${SUITE}.%ARCH%.non-free ${NFSOURCES} . ${NFPACKAGES} || true
+        # Now add the overlay suite as above.
+        SOURCES_BASE="${ARCHIVE_BASE}/archive/${SUITE}/{main,contrib}/source/Sources${EXT}"
+        PACKAGES_BASE="${ARCHIVE_BASE}/archive/${SUITE}/{main,contrib}/binary-%ARCH%/Packages${EXT}"
+        PACKAGES_BASE="${PACKAGES_BASE} ${ARCHIVE_BASE}/archive/${SUITE}/{main,contrib}/debian-installer/binary-%ARCH%/Packages${EXT}"
+        trigger_wb_update_for_overlay "$SUITE" "`get_architectures $SUITE`" "$SOURCES_BASE" "$PACKAGES_BASE" "$SOURCES" "$PACKAGES"
+
+        if [ -f "${ARCHIVE_BASE}/archive/${SUITE}-backports/main/source/Sources${EXT}" ]; then
+            SOURCES_BP="${ARCHIVE_BASE}/archive/${SUITE}-backports/{main,contrib}/source/Sources${EXT}"
+            NFSOURCES_BP="${ARCHIVE_BASE}/archive/${SUITE}-backports/non-free/source/Sources${EXT}"
+            PACKAGES_BP="${ARCHIVE_BASE}/archive/${SUITE}-backports/{main,contrib}/binary-%ARCH%/Packages${EXT}"
+            NFPACKAGES_BP="${ARCHIVE_BASE}/archive/${SUITE}-backports/non-free/binary-%ARCH%/Packages${EXT}"
+            /srv/wanna-build/bin/filter-nonfree /srv/wanna-build/etc/non-free-include-list "`get_architectures $SUITE`" "Sources.${SUITE}-backports.non-free" "Packages.${SUITE}-backports.%ARCH%.non-free" ${NFSOURCES_BP} . ${NFPACKAGES_BP} || true
+            trigger_wb_update_with_secondary "${SUITE}-backports" "`get_architectures ${SUITE}-backports`" "$PACKAGES_BASE" "$SOURCES_BP" "$PACKAGES_BP" "${SUITE}-backports"
+        fi
+
+        if [ -f "${ARCHIVE_BASE}/archive/${SUITE}-backports-sloppy/main/source/Sources${EXT}" ]; then
+            SOURCES_BP="${ARCHIVE_BASE}/archive/${SUITE}-backports-sloppy/{main,contrib}/source/Sources${EXT}"
+            PACKAGES_BP="${ARCHIVE_BASE}/archive/${SUITE}-backports{-sloppy,}/{main,contrib}/binary-%ARCH%/Packages${EXT}"
+            trigger_wb_update_with_secondary "${SUITE}-backports-sloppy" "`get_architectures ${SUITE}-backports-sloppy`" "$PACKAGES_BASE" "$SOURCES_BP" "$PACKAGES_BP" "${SUITE}-backports-sloppy"
+        fi
+    done
+
+    for SUITE in $SUITES_FAST_AUTOBUILD
+    do
+        EXT="`get_index_extension ${SUITE}`"
+
+        SOURCES="${ARCHIVE_BASE}/archive/${SUITE}/{main,contrib}/source/Sources${EXT}"
+        SOURCES="${SOURCES} ${ARCHIVE_BASE}/debian-buildd-dists/buildd-${SUITE}/{main,contrib}/source/Sources${EXT}"
+        NFSOURCES="${ARCHIVE_BASE}/archive/${SUITE}/non-free/source/Sources${EXT}"
+        PACKAGES="${ARCHIVE_BASE}/archive/${SUITE}/{main,contrib}/binary-%ARCH%/Packages${EXT}"
+        PACKAGES="${PACKAGES} ${ARCHIVE_BASE}/archive/${SUITE}/{main,contrib}/debian-installer/binary-%ARCH%/Packages${EXT}"
+        PACKAGES="${PACKAGES} ${ARCHIVE_BASE}/debian-buildd-dists/buildd-${SUITE}/{main,contrib}/binary-%ARCH%/Packages${EXT}"
+        PACKAGES="${PACKAGES} ${ARCHIVE_BASE}/debian-buildd-dists/buildd-${SUITE}/{main,contrib}/debian-installer/binary-%ARCH%/Packages${EXT}"
+        NFPACKAGES="${ARCHIVE_BASE}/archive/${SUITE}/non-free/binary-%ARCH%/Packages${EXT}"
+        NFPACKAGES="${NFPACKAGES} ${ARCHIVE_BASE}/archive/${SUITE}/non-free/debian-installer/binary-%ARCH%/Packages${EXT}"
+        /srv/wanna-build/bin/filter-nonfree /srv/wanna-build/etc/non-free-include-list "`get_architectures $SUITE`" Sources.${SUITE}.non-free Packages.${SUITE}.%ARCH%.non-free ${NFSOURCES} . ${NFPACKAGES} || true
+
+        if [ "$SUITE" = "sid" ]
+        then
+            # sid is not an overlay.
+            trigger_wb_update "${SUITE}" "`get_architectures ${SUITE}`" "$SOURCES" "$PACKAGES"
+        else
+            BASE_SUITE=sid
+            PACKAGES_BASE="${ARCHIVE_BASE}/archive/${BASE_SUITE}/{main,contrib}/binary-%ARCH%/Packages${EXT}"
+            PACKAGES_BASE="${PACKAGES_BASE} ${ARCHIVE_BASE}/archive/${BASE_SUITE}/{main,contrib}/debian-installer/binary-%ARCH%/Packages${EXT}"
+            PACKAGES_BASE="${PACKAGES_BASE} ${ARCHIVE_BASE}/debian-buildd-dists/buildd-${BASE_SUITE}/{main,contrib}/binary-%ARCH%/Packages${EXT}"
+            PACKAGES_BASE="${PACKAGES_BASE} ${ARCHIVE_BASE}/debian-buildd-dists/buildd-${BASE_SUITE}/{main,contrib}/debian-installer/binary-%ARCH%/Packages${EXT}"
+            trigger_wb_update_with_secondary "$SUITE" "`get_architectures $SUITE`" "$PACKAGES_BASE" "$SOURCES" "$PACKAGES"
+        fi
+    done
+
+    cleanup
+}
+
+main() {
+    set -eE
+    trap cleanup ERR TERM HUP INT QUIT
+
+    save-database pre
+
+    main_sync
+
+    save-database post
+    do_stats
+}
+
+main
+exit 0
+

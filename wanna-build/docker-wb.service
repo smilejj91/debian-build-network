@@ -1,0 +1,12 @@
+[Unit]
+Description=Wanna build as Docker instance
+After=network-online.target
+Requires=network-online.target
+
+[Service]
+ExecStart=docker run --rm -t --hostname buildd --domainname ci.tmaxos.net --name wb -p 22:22 wb:stable
+ExecStop=docker stop wb
+
+[Install]
+WantedBy=multi-user.target
+Alias=wb.service
